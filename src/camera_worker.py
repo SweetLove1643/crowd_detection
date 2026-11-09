@@ -15,12 +15,11 @@ from src.detector import PersonDetector
 from src.analyze import ProximityEvaluator
 import src.config as cf
 from src.camera_manager import Camera
+from src.gstreamer import GStreamerReader
 from src.publisher import publish_bbox, publish_crowd_event
 
 log = logging.getLogger("camera_worker")
 
-OPEN_TIMEOUT_MS = 5_000
-READ_TIMEOUT_MS = 5_000
 RECONNECT_DELAY_S = 3
 DEBUG_FRAME_SAVE_INTERVAL_S = 5.0
 PERFORMANCE_LOG_INTERVAL_S = 5.0
@@ -405,8 +404,11 @@ class CameraWorker:
         last_cluster_log_time = 0.0
         last_snapshot_time = 0.0
         last_performance_log_time = time.monotonic()
-        last_frame_time: float | None = None
-        frame_count = 0
+        last_ai_processed_time: float | None = None
+        read_frame_count = 0
+        ai_processed_frame_count = 0
+        bbox_publish_attempt_count = 0
+        bbox_publish_accepted_count = 0
         inference_time_total_ms = 0.0
         publish_results: queue.Queue[tuple[set[int], bool]] = queue.Queue()
 
@@ -423,16 +425,9 @@ class CameraWorker:
             capture = None
 
             try:
-                capture = cv2.VideoCapture(
-                    "./resources/recordings/nhatron-loira_20261105_163141.mp4",
-                    # self.camera.rtsp_url,
-                    cv2.CAP_FFMPEG,
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                        OPEN_TIMEOUT_MS,
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                        READ_TIMEOUT_MS,
-                    ],
+                capture = GStreamerReader(
+                    rtsp_url=self.camera.rtsp_url,
+                    latency=150,
                 )
 
                 if not capture.isOpened():
@@ -451,6 +446,8 @@ class CameraWorker:
                                 frame is None,
                             )
                             break
+
+                        read_frame_count += 1
 
                         if debug_writer is None and not debug_video_disabled:
                             safe_camera_code = "".join(
@@ -486,14 +483,6 @@ class CameraWorker:
                                 debug_writer = None
                                 debug_video_disabled = True
 
-                        frame_started_at = time.monotonic()
-                        processing_fps = (
-                            1 / (frame_started_at - last_frame_time)
-                            if last_frame_time is not None
-                            and frame_started_at > last_frame_time
-                            else 0.0
-                        )
-                        last_frame_time = frame_started_at
                         inference_started = time.perf_counter()
                         dets = detector.track(frame)
                         inference_ms = (time.perf_counter() - inference_started) * 1000
@@ -521,6 +510,16 @@ class CameraWorker:
                             dets,
                             now,
                         )
+                        ai_processed_frame_count += 1
+                        ai_completed_at = time.monotonic()
+                        processing_fps = (
+                            1 / (ai_completed_at - last_ai_processed_time)
+                            if last_ai_processed_time is not None
+                            and ai_completed_at > last_ai_processed_time
+                            else 0.0
+                        )
+                        last_ai_processed_time = ai_completed_at
+
                         if now - last_cluster_log_time >= 1.0:
                             cluster_details = [
                                 {
@@ -653,25 +652,42 @@ class CameraWorker:
                             hud_text,
                             CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX,
                         )
+                        bbox_publish_attempt_count += 1
+                        if bbox_published:
+                            bbox_publish_accepted_count += 1
 
-                        frame_count += 1
                         inference_time_total_ms += inference_ms
-                        if now - last_performance_log_time >= PERFORMANCE_LOG_INTERVAL_S:
-                            elapsed = now - last_performance_log_time
+                        performance_now = time.monotonic()
+                        if performance_now - last_performance_log_time >= PERFORMANCE_LOG_INTERVAL_S:
+                            elapsed = performance_now - last_performance_log_time
                             log.info(
-                                "Realtime performance camera=%s frames=%d "
-                                "fps=%.2f avg_inference_ms=%.1f "
-                                "bbox_count=%d bbox_publish_ok=%s",
+                                "Realtime rates camera=%s "
+                                "rtsp_read_frames=%d rtsp_read_fps=%.2f "
+                                "ai_processed_frames=%d ai_processed_fps=%.2f "
+                                "bbox_publish_attempts=%d bbox_attempt_fps=%.2f "
+                                "bbox_publish_accepted=%d bbox_accepted_fps=%.2f "
+                                "avg_inference_ms=%.1f",
                                 self.camera.code,
-                                frame_count,
-                                frame_count / elapsed,
-                                inference_time_total_ms / frame_count,
-                                len(bbox_detections),
-                                bbox_published,
+                                read_frame_count,
+                                read_frame_count / elapsed,
+                                ai_processed_frame_count,
+                                ai_processed_frame_count / elapsed,
+                                bbox_publish_attempt_count,
+                                bbox_publish_attempt_count / elapsed,
+                                bbox_publish_accepted_count,
+                                bbox_publish_accepted_count / elapsed,
+                                (
+                                    inference_time_total_ms / ai_processed_frame_count
+                                    if ai_processed_frame_count
+                                    else 0.0
+                                ),
                             )
-                            frame_count = 0
+                            read_frame_count = 0
+                            ai_processed_frame_count = 0
+                            bbox_publish_attempt_count = 0
+                            bbox_publish_accepted_count = 0
                             inference_time_total_ms = 0.0
-                            last_performance_log_time = now
+                            last_performance_log_time = performance_now
 
                         if now - last_snapshot_time >= DEBUG_FRAME_SAVE_INTERVAL_S:
                             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -705,7 +721,7 @@ class CameraWorker:
                             debug_video_frame_count += 1
 
             except Exception:
-                log.exception("OpenCV failed for camera=%s", self.camera.code)
+                log.exception("Camera processing pipeline failed for camera=%s", self.camera.code)
 
             finally:
                 if capture is not None:
