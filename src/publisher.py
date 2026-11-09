@@ -106,8 +106,8 @@ def publish_crowd_event(
         "severity": "HIGH",
         "payload": {
             "type": "HIGH_DENSITY",
-            "person_count": sum(cluster["person_count"] for cluster in crowded_clusters),
-            "threshold": cf.NUMBER_PERSON_IS_CROWDED,
+            "person_count": sum(cluster.get("person_count", 0) for cluster in crowded_clusters),
+            "threshold": int(cf.NUMBER_PERSON_IS_CROWDED),
             "clusters": crowded_clusters,
         },
     }

@@ -52,6 +52,17 @@ def on_stop(code: str) -> None:
     worker.stop()
     log.info("STOP camera=%s", code)
 
+
+def stop_camera_workers() -> None:
+    with workers_lock:
+        workers = list(camera_workers.items())
+        camera_workers.clear()
+
+    for code, worker in workers:
+        worker.stop(timeout=None)
+        log.info("STOP camera=%s", code)
+
+
 camera_manger = CameraManager(on_start, on_stop)
 
 def build_client() -> mqtt.Client:

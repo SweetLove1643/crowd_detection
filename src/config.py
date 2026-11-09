@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MODULE = os.getenv("MODULE")
+MODULE = (os.getenv("MODULE") or "CROWD_DETECTION").upper()
 ZONE_ID = os.getenv("ZONE_ID", "51")
 ORG_ID = os.getenv("ORG_ID", "103")
 

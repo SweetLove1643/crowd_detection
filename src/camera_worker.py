@@ -64,44 +64,44 @@ class CrowdPersistence:
         ready: list[tuple[int, list[int], set[int]]] = []
 
         for cluster_index, cluster in crowded_clusters:
-            track_ids = {detections[index][5] for index in cluster}
-            if None in track_ids:
-                continue
-            tracked_ids = {track_id for track_id in track_ids if track_id is not None}
+            tracked_ids = {
+                int(detections[index][5])
+                for index in cluster
+                if detections[index][5] is not None
+            }
             if not tracked_ids:
                 continue
 
-            match_index = max(
-                available,
-                key=lambda index: len(
-                    self._candidates[index].track_ids & tracked_ids
-                ),
-                default=None,
-            )
-            if match_index is not None and not (
-                self._candidates[match_index].track_ids & tracked_ids
-            ):
-                match_index = None
+            match_index = None
+            best_overlap = -1
+            for index in sorted(available):
+                overlap = len(self._candidates[index].track_ids & tracked_ids)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    match_index = index
+
+            if match_index is not None:
+                candidate = self._candidates[match_index]
+                if candidate.track_ids & tracked_ids:
+                    available.discard(match_index)
+                    candidate.track_ids = tracked_ids
+                    candidate.last_seen = now
+                else:
+                    match_index = None
 
             if match_index is None:
-                candidate = _CrowdCandidate(tracked_ids, now, now)
+                candidate = _CrowdCandidate(set(tracked_ids), now, now)
                 self._candidates.append(candidate)
-            else:
-                available.remove(match_index)
-                candidate = self._candidates[match_index]
-                candidate.track_ids = tracked_ids
-                candidate.last_seen = now
-
+            
             if not candidate.notified and now - candidate.started_at >= self.duration_s:
-                ready.append((cluster_index, cluster, tracked_ids))
+                ready.append((cluster_index, cluster, set(tracked_ids)))
 
         return ready
 
     def mark_notified(self, track_ids: set[int]) -> None:
         for candidate in self._candidates:
-            if candidate.track_ids == track_ids:
+            if candidate.track_ids & track_ids:
                 candidate.notified = True
-                return
 
 
 def _build_bbox_detections(
@@ -319,7 +319,7 @@ class CameraWorker:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 7) -> None:
+    def stop(self, timeout: float | None = 7) -> None:
         self._stop_event.set()
 
         if self._thread is None:
@@ -327,7 +327,7 @@ class CameraWorker:
 
         self._thread.join(timeout=timeout)
 
-        if self._thread.is_alive():
+        if timeout is not None and self._thread.is_alive():
             log.warning("Worker camera=%s haven't stopped yet %.1f second", self.camera.code, timeout)
 
     def _run(self) -> None:
@@ -361,7 +361,8 @@ class CameraWorker:
 
             try:
                 capture = cv2.VideoCapture(
-                    self.camera.rtsp_url,
+                    "./resources/recordings/nhatron-loira_20261105_163141.mp4",
+                    # self.camera.rtsp_url,
                     cv2.CAP_FFMPEG,
                     [
                         cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,

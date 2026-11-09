@@ -34,11 +34,18 @@ class CameraManager:
 
     def get_camera(self, raw: bytes) -> None:
         cams = safe_json(raw=raw).get("cameras") or []
-        enabled = {
-            c["code"]: Camera(c["id"], c["code"], c["rtsp_url"])
-            for c in cams
-            if MODULE in (c.get("ai_modules") or [])
-        }
+        enabled = {}
+        for c in cams:
+            raw_modules = c.get("ai_modules") or []
+            if isinstance(raw_modules, str):
+                raw_modules = [raw_modules]
+            module_names = {str(item).strip().upper() for item in raw_modules}
+            if MODULE.upper() not in module_names:
+                continue
+            code = str(c["code"]).strip()
+            if not code:
+                continue
+            enabled[code] = Camera(str(c["id"]), code, str(c["rtsp_url"]))
         with self._lock:
             self._cameras =enabled
         log.info("Camera bật module %s: %s", MODULE, list(enabled))
