@@ -1,0 +1,8 @@
+.aider*
+.env
+.venv
+logs/
+resources/
+AI_MODULES_MQTT.md
+yolov8n.pt
+*__pycache__/
