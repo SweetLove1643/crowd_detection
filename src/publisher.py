@@ -25,7 +25,22 @@ def upload_snapshot(jpg: bytes, camera_id: str) -> str | None:
             timeout=10,
         )
         r.raise_for_status()
-        return r.json().get("object_key")
+        response = r.json()
+        object_key = response.get("object_key") if isinstance(response, dict) else None
+        if not object_key or response.get("success") is False:
+            log.error(
+                "Storage upload unsuccessful camera=%s status=%s has_object_key=%s",
+                camera_id,
+                r.status_code,
+                bool(object_key),
+            )
+            return None
+        log.info(
+            "Snapshot uploaded camera=%s object_key=%s",
+            camera_id,
+            object_key,
+        )
+        return str(object_key)
     except Exception:
         log.exception("upload ảnh lỗi camera=%s", camera_id)
         return None
@@ -94,7 +109,18 @@ def publish_crowd_event(
     crowded_clusters: list[dict],
     jpg: bytes | None = None,
 ) -> bool:
-    object_key = upload_snapshot(jpg, cam_id) if jpg else None
+    if not jpg:
+        log.error("Crowd event has no snapshot camera=%s; event not published", cam_code)
+        return False
+
+    object_key = upload_snapshot(jpg, cam_id)
+    if not object_key:
+        log.error(
+            "Crowd event not published because snapshot upload failed camera=%s",
+            cam_code,
+        )
+        return False
+
     event = {
         "ai_modules": cf.MODULE,
         "submodule_code": cf.MODULE,
@@ -111,8 +137,7 @@ def publish_crowd_event(
             "clusters": crowded_clusters,
         },
     }
-    if object_key:
-        event["snapshot_url"] = object_key
+    event["snapshot_url"] = object_key
     topic = f"smart_vms/ai_events/{cf.MODULE}"
 
     try:
@@ -132,7 +157,8 @@ def publish_crowd_event(
             return False
 
         log.info(
-            "MQTT crowd event sent camera=%s topic=%s clusters=%d object_key=%s",
+            "MQTT crowd event broker-acknowledged camera=%s topic=%s "
+            "clusters=%d object_key=%s",
             cam_code,
             topic,
             len(crowded_clusters),

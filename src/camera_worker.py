@@ -1,5 +1,6 @@
 # Bước 3: 1 camera = 1 thread, đọc RTSP
 import logging
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -23,8 +24,13 @@ READ_TIMEOUT_MS = 5_000
 RECONNECT_DELAY_S = 3
 DEBUG_FRAME_SAVE_INTERVAL_S = 5.0
 PERFORMANCE_LOG_INTERVAL_S = 5.0
-DEBUG_VIDEO_FPS = 10.0
+DEBUG_VIDEO_FPS = 13.0
 CROWD_TRACK_GRACE_S = 1.0
+CROWD_EVENT_RETRY_DELAY_S = 5.0
+PERSON_COLOR_BGR = (0, 255, 0)
+CROWD_COLOR_BGR = (0, 0, 255)
+PERSON_COLOR_HEX = "#00ff00"
+CROWD_COLOR_HEX = "#ff0000"
 
 Detection = tuple[float, float, float, float, float, int | None]
 Cluster = list[int]
@@ -37,6 +43,9 @@ class _CrowdCandidate:
     started_at: float
     last_seen: float
     notified: bool = False
+    publishing: bool = False
+    last_publish_attempt: float = 0.0
+    last_successful_publish: float | None = None
 
 
 class CrowdPersistence:
@@ -93,15 +102,52 @@ class CrowdPersistence:
                 candidate = _CrowdCandidate(set(tracked_ids), now, now)
                 self._candidates.append(candidate)
             
-            if not candidate.notified and now - candidate.started_at >= self.duration_s:
+            persistence_met = now - candidate.started_at >= self.duration_s
+            retry_due = now - candidate.last_publish_attempt >= CROWD_EVENT_RETRY_DELAY_S
+            last_successful_publish = candidate.last_successful_publish
+            if candidate.notified and last_successful_publish is not None:
+                repeat_interval_elapsed = (
+                    now - last_successful_publish
+                    >= cf.CROWD_EVENT_REPEAT_INTERVAL_SECONDS
+                )
+                previous_attempt_failed = (
+                    candidate.last_publish_attempt > last_successful_publish
+                )
+                publish_due = repeat_interval_elapsed and (
+                    not previous_attempt_failed or retry_due
+                )
+            else:
+                publish_due = (
+                    not candidate.notified
+                    and (
+                        candidate.last_publish_attempt == 0
+                        or retry_due
+                    )
+                )
+
+            if (
+                persistence_met
+                and not candidate.publishing
+                and publish_due
+            ):
+                candidate.publishing = True
+                candidate.last_publish_attempt = now
                 ready.append((cluster_index, cluster, set(tracked_ids)))
 
         return ready
 
-    def mark_notified(self, track_ids: set[int]) -> None:
+    def complete_publish(
+        self,
+        track_ids: set[int],
+        success: bool,
+        completed_at: float,
+    ) -> None:
         for candidate in self._candidates:
             if candidate.track_ids & track_ids:
-                candidate.notified = True
+                candidate.publishing = False
+                if success:
+                    candidate.notified = True
+                    candidate.last_successful_publish = completed_at
 
 
 def _build_bbox_detections(
@@ -132,12 +178,14 @@ def _build_bbox_detections(
             continue
 
         x1, y1, x2, y2, confidence, track_id = detection
+        person_id = (
+            f"person_{track_id}"
+            if track_id is not None
+            else f"person_{detection_index}"
+        )
         person_bbox: dict[str, object] = {
-            "id": (
-                f"person_{track_id}"
-                if track_id is not None
-                else f"person_{detection_index}"
-            ),
+            "id": person_id,
+            "label": f"{person_id} {confidence:.2f}",
             "class": "person",
             "confidence": round(confidence, 4),
             "bbox": [
@@ -146,7 +194,7 @@ def _build_bbox_detections(
                 round(x2 / frame_width, 6),
                 round(y2 / frame_height, 6),
             ],
-            "color": "#ef4444" if is_crowd_member else "#22c55e",
+            "color": CROWD_COLOR_HEX if is_crowd_member else PERSON_COLOR_HEX,
             "cluster_id": detection_clusters[detection_index],
         }
         if track_id is not None:
@@ -169,6 +217,7 @@ def _build_bbox_detections(
         bbox_detections.append(
             {
                 "id": f"crowd_{cluster_index + 1}",
+                "label": f"crowd_{cluster_index + 1} ({len(cluster)} people)",
                 "class": "crowd",
                 "bbox": [
                     round(x1 / frame_width, 6),
@@ -176,7 +225,7 @@ def _build_bbox_detections(
                     round(x2 / frame_width, 6),
                     round(y2 / frame_height, 6),
                 ],
-                "color": "#ef4444",
+                "color": CROWD_COLOR_HEX,
                 "cluster_id": cluster_index + 1,
                 "person_count": len(cluster),
                 "track_ids": sorted(
@@ -234,7 +283,7 @@ def _annotate_bbox_detections(
         is_crowd_member = detection_index in crowd_indices
         draw_box(
             (x1, y1, x2, y2),
-            (0, 0, 255) if is_crowd_member else (0, 255, 0),
+            CROWD_COLOR_BGR if is_crowd_member else PERSON_COLOR_BGR,
             (
                 f"person_{track_id}"
                 if track_id is not None
@@ -258,7 +307,7 @@ def _annotate_bbox_detections(
                 min(frame.shape[1], x2 + pad_x),
                 min(frame.shape[0], y2 + pad_y),
             ),
-            (0, 0, 255),
+            CROWD_COLOR_BGR,
             f"crowd_{cluster_index + 1} ({len(cluster)} people)",
         )
 
@@ -281,11 +330,25 @@ def _publish_crowd_event_async(
     camera_code: str,
     clusters: list[dict],
     snapshot_jpg: bytes | None,
+    track_ids: set[int],
+    result_queue: queue.Queue[tuple[set[int], bool]],
 ) -> bool:
+    def publish_and_report() -> None:
+        try:
+            success = publish_crowd_event(
+                client,
+                camera_id,
+                camera_code,
+                clusters,
+                jpg=snapshot_jpg,
+            )
+        except Exception:
+            log.exception("Crowd event publisher crashed camera=%s", camera_code)
+            success = False
+        result_queue.put((track_ids, success))
+
     thread = threading.Thread(
-        target=publish_crowd_event,
-        args=(client, camera_id, camera_code, clusters),
-        kwargs={"jpg": snapshot_jpg},
+        target=publish_and_report,
         name=f"crowd-event-{camera_code}",
         daemon=True,
     )
@@ -345,13 +408,13 @@ class CameraWorker:
         last_frame_time: float | None = None
         frame_count = 0
         inference_time_total_ms = 0.0
+        publish_results: queue.Queue[tuple[set[int], bool]] = queue.Queue()
 
         image_save_dir = Path(__file__).resolve().parents[1] / "resources" / "img_test"
         image_save_dir.mkdir(parents=True, exist_ok=True)
         debug_video_dir = Path(__file__).resolve().parents[1] / "resources" / "debug_videos"
         debug_video_dir.mkdir(parents=True, exist_ok=True)
         debug_writer = None
-        debug_video_started_at: float | None = None
         debug_video_frame_count = 0
         debug_video_disabled = False
         debug_video_path: Path | None = None
@@ -407,7 +470,6 @@ class CameraWorker:
                                 (frame_width, frame_height),
                             )
                             if debug_writer.isOpened():
-                                debug_video_started_at = time.monotonic()
                                 log.info(
                                     "Debug video started camera=%s path=%s fps=%.1f",
                                     self.camera.code,
@@ -444,6 +506,16 @@ class CameraWorker:
                         is_crowded = bool(crowded_clusters)
 
                         now = time.monotonic()
+                        while True:
+                            try:
+                                published_track_ids, publish_succeeded = publish_results.get_nowait()
+                            except queue.Empty:
+                                break
+                            crowd_persistence.complete_publish(
+                                published_track_ids,
+                                publish_succeeded,
+                                now,
+                            )
                         ready_clusters = crowd_persistence.update(
                             crowded_clusters,
                             dets,
@@ -530,6 +602,9 @@ class CameraWorker:
                                     "Failed to encode crowd snapshot camera=%s",
                                     self.camera.code,
                                 )
+                            event_track_ids = set().union(
+                                *(track_ids for _, _, track_ids in ready_clusters)
+                            )
                             event_scheduled = _publish_crowd_event_async(
                                 self.client,
                                 self.camera.id,
@@ -544,16 +619,26 @@ class CameraWorker:
                                     for cluster_index, cluster, track_ids in ready_clusters
                                 ],
                                 snapshot_jpg=snapshot_jpg,
+                                track_ids=event_track_ids,
+                                result_queue=publish_results,
                             )
                             if not event_scheduled:
+                                crowd_persistence.complete_publish(
+                                    event_track_ids,
+                                    False,
+                                    now,
+                                )
                                 log.error(
                                     "Crowd event was not scheduled camera=%s; "
                                     "will retry while crowd persists",
                                     self.camera.code,
                                 )
                             else:
-                                for _, _, track_ids in ready_clusters:
-                                    crowd_persistence.mark_notified(track_ids)
+                                log.info(
+                                    "Crowd event publishing started camera=%s clusters=%d",
+                                    self.camera.code,
+                                    len(ready_clusters),
+                                )
 
                         hud_text = (
                             f"CROWD: {len(crowded_clusters)} cluster(s)"
@@ -566,7 +651,7 @@ class CameraWorker:
                             self.camera.code,
                             bbox_detections,
                             hud_text,
-                            "#ef4444" if is_crowded else "#22c55e",
+                            CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX,
                         )
 
                         frame_count += 1
@@ -615,15 +700,9 @@ class CameraWorker:
                                 )
                             last_snapshot_time = now
 
-                        if debug_writer is not None and debug_video_started_at is not None:
-                            elapsed = time.monotonic() - debug_video_started_at
-                            target_frame_count = max(
-                                debug_video_frame_count + 1,
-                                int(round(elapsed * DEBUG_VIDEO_FPS)),
-                            )
-                            for _ in range(target_frame_count - debug_video_frame_count):
-                                debug_writer.write(debug_frame)
-                            debug_video_frame_count = target_frame_count
+                        if debug_writer is not None:
+                            debug_writer.write(debug_frame)
+                            debug_video_frame_count += 1
 
             except Exception:
                 log.exception("OpenCV failed for camera=%s", self.camera.code)
