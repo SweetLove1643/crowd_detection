@@ -6,7 +6,9 @@ from typing import Literal, Sequence
 import cv2
 import numpy as np
 
-Box = Sequence[float]  
+from src import config as cf
+
+Box = Sequence[float]
 LengthMode = Literal["max", "height"]
 
 
@@ -14,20 +16,28 @@ class ProximityEvaluator:
 
     def __init__(
         self,
-        alpha: float = 1.5,
-        length_mode: LengthMode = "max",
-        y_scale: float = 1.5,
+        alpha: float | None = None,
+        length_mode: LengthMode | None = None,
+        y_scale: float | None = None,
     ) -> None:
-        if alpha <= 0:
-            raise ValueError("alpha phải > 0")
-        if y_scale <= 0:
-            raise ValueError("y_scale phải > 0")
-        if length_mode not in ("max", "height"):
-            raise ValueError(f"length_mode không hợp lệ: {length_mode}")
+        resolved_alpha = cf.PROXIMITY_ALPHA if alpha is None else alpha
+        resolved_length_mode = (
+            cf.PROXIMITY_LENGTH_MODE if length_mode is None else length_mode
+        )
+        resolved_y_scale = cf.PROXIMITY_Y_SCALE if y_scale is None else y_scale
 
-        self.alpha = alpha
-        self.length_mode = length_mode
-        self.y_scale = y_scale  # >1 để bù phối cảnh nén trục y
+        if resolved_alpha <= 0:
+            raise ValueError("alpha phải > 0")
+        if resolved_y_scale <= 0:
+            raise ValueError("y_scale phải > 0")
+        if resolved_length_mode not in ("max", "height"):
+            raise ValueError(
+                f"length_mode không hợp lệ: {resolved_length_mode}"
+            )
+
+        self.alpha = float(resolved_alpha)
+        self.length_mode: LengthMode = resolved_length_mode  # type: ignore[assignment]
+        self.y_scale = float(resolved_y_scale)  # >1 để bù phối cảnh nén trục y
 
     # ---------- helpers ----------
     @staticmethod
