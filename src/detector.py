@@ -78,15 +78,23 @@ class PersonDetector:
     def __init__(
         self,
         weights_path: str | Path | None = None,
-        confidence: float = 0.1,
+        confidence: float | None = None,
     ) -> None:
-        if not 0.0 <= confidence <= 1.0:
+        resolved_weights = (
+            cf.WEIGHT_YOLO_MODEL_PATH if weights_path is None else weights_path
+        )
+        resolved_conf = (
+            float(cf.YOLO_MODEL_CONF)
+            if confidence is None
+            else float(confidence)
+        )
+        if not 0.0 <= resolved_conf <= 1.0:
             raise ValueError("Confidence threshold model error")
-        if weights_path is None:
-            raise FileNotFoundError(f"Model path failed: {weights_path}")
+        if resolved_weights is None:
+            raise FileNotFoundError(f"Model path failed: {resolved_weights}")
 
-        weights_path = Path(weights_path)
-        self._confidence = confidence
+        weights_path = Path(resolved_weights)
+        self._confidence = resolved_conf
         self._camera_trackers: list[Any] | None = None
         self._backend, self._device, model_target, self._imgsz, self._half = (
             self._select_runtime(weights_path)

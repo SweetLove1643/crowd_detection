@@ -6,10 +6,12 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from src import config as cf
+
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 LOG_DIR = PROJECT_DIR / "logs"
 LOG_FILE = LOG_DIR / "app.log"
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+LOG_LEVEL = cf.LOG_LEVEL.strip().upper()
 
 FORMAT = "%(asctime)s | %(levelname)-7s | %(threadName)-16s | %(name)-14s | %(message)s"
 MAX_BYTES = 5 * 1024 * 1024  # 5 MB / file

@@ -1,4 +1,6 @@
-# đọc .env (ngưỡng, cooldown, margin...)
+# Cấu hình tập trung của hệ thống:
+# - Thông tin kết nối môi trường (MQTT, Zone, Storage) được đọc từ file .env
+# - Toàn bộ tham số AI, Model, Tracking, Crowd, BBox, Debug được cấu hình trực tiếp tại file này (Single Source of Truth)
 import os
 
 from dotenv import load_dotenv
@@ -15,16 +17,19 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-MODULE = (os.getenv("MODULE") or "CROWD_DETECTION").strip().upper()
-ZONE_ID = os.getenv("ZONE_ID", "51").strip()
-ORG_ID = os.getenv("ORG_ID", "103").strip()
+# ==============================================================================
+# 1. THÔNG TIN ĐỊNH DANH & KẾT NỐI SERVER (Đọc từ .env)
+# ==============================================================================
+MODULE = os.environ["MODULE"].strip().upper()
+ZONE_ID = os.environ["ZONE_ID"].strip()
+ORG_ID = os.environ["ORG_ID"].strip()
 
 MQTT_HOST = os.environ["MQTT_HOST"].strip()
-MQTT_PORT = int(os.getenv("MQTT_PORT", "443"))
-MQTT_PATH = os.getenv("MQTT_PATH", "/mqtt").strip()
+MQTT_PORT = int(os.environ["MQTT_PORT"])
+MQTT_PATH = os.environ["MQTT_PATH"].strip()
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASS = os.environ["MQTT_PASS"]
-MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "phan_van_quan").strip()
+MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"].strip()
 MQTT_TLS_ENABLED = _env_bool(
     "MQTT_TLS_ENABLED",
     "true" if MQTT_PORT == 443 else "false",
@@ -35,56 +40,50 @@ STORAGE_URL = os.getenv(
     "https://aioc.atin.vn/storage/upload/file",
 ).strip()
 
-WEIGHT_YOLO_MODEL_PATH = os.getenv(
-    "WEIGHT_YOLO_MODEL_PATH",
-    "./resources/runs/train/weights/best.pt",
-).strip()
-OPENVINO_MODEL_PATH = os.getenv(
-    "OPENVINO_MODEL_PATH",
-    "./resources/runs/train/weights/best_openvino_model",
-).strip()
-YOLO_INFERENCE_BACKEND = (
-    os.getenv("YOLO_INFERENCE_BACKEND", "auto").strip().lower()
-)
-YOLO_OPENVINO_DEVICE = os.getenv("YOLO_OPENVINO_DEVICE", "intel:cpu").strip()
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "1280"))
-YOLO_HALF_PRECISION = _env_bool("YOLO_HALF_PRECISION", "true")
-YOLO_MODEL_CONF = float(os.getenv("YOLO_MODEL_CONF", "0.5"))
-YOLO_CPU_THREADS = int(os.getenv("YOLO_CPU_THREADS", "4"))
-MAX_CONCURRENT_INFERENCES = int(os.getenv("MAX_CONCURRENT_INFERENCES", "1"))
+# ==============================================================================
+# 2. CẤU HÌNH MODEL AI & INFERENCE (Chỉnh sửa trực tiếp tại đây)
+# ==============================================================================
+WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/final.pt"
+OPENVINO_MODEL_PATH = "./resources/runs/train/weights/final_openvino_model"
+YOLO_INFERENCE_BACKEND = "auto"  # "auto" | "pytorch" | "cuda" | "openvino" | "tensorrt"
+YOLO_OPENVINO_DEVICE = "intel:cpu"
+YOLO_IMGSZ = 640
+YOLO_HALF_PRECISION = True
+YOLO_MODEL_CONF = 0.6
+YOLO_CPU_THREADS = 4
+MAX_CONCURRENT_INFERENCES = 1
 
-PROXIMITY_ALPHA = float(os.getenv("PROXIMITY_ALPHA", "1.5"))
-PROXIMITY_Y_SCALE = float(os.getenv("PROXIMITY_Y_SCALE", "1.5"))
-PROXIMITY_LENGTH_MODE = (
-    os.getenv("PROXIMITY_LENGTH_MODE", "max").strip().lower()
-)
+# ==============================================================================
+# 3. CẤU HÌNH ĐÁNH GIÁ KHOẢNG CÁCH & ĐÁM ĐÔNG (Chỉnh sửa trực tiếp tại đây)
+# ==============================================================================
+PROXIMITY_ALPHA = 1.5
+PROXIMITY_Y_SCALE = 1.5
+PROXIMITY_LENGTH_MODE = "max"  # "max" | "height"
 
-DEBUG_VIDEO_ENABLED = _env_bool("DEBUG_VIDEO_ENABLED", "false")
-DEBUG_FRAME_SAVE_ENABLED = _env_bool("DEBUG_FRAME_SAVE_ENABLED", "false")
-DEBUG_VIDEO_FPS = float(os.getenv("DEBUG_VIDEO_FPS", "10.0"))
-DEBUG_MAX_SAVED_FRAMES = int(os.getenv("DEBUG_MAX_SAVED_FRAMES", "200"))
-DEBUG_MAX_SAVED_VIDEOS = int(os.getenv("DEBUG_MAX_SAVED_VIDEOS", "10"))
+NUMBER_PERSON_IS_CROWDED = 5
+CROWD_PERSISTENCE_SECONDS = 4.0
+CROWD_TRACK_GRACE_SECONDS = 2.5
+CROWD_SPATIAL_IOU_THRESHOLD = 0.25
+CROWD_CENTER_DISTANCE_RATIO = 0.6
+CROWD_EVENT_REPEAT_INTERVAL_SECONDS = 10.0
+CROWD_BBOX_PADDING_PERCENT = 10.0
 
-NUMBER_PERSON_IS_CROWDED = int(os.getenv("NUMBER_PERSON_IS_CROWDED", "5"))
-CROWD_PERSISTENCE_SECONDS = float(os.getenv("CROWD_PERSISTENCE_SECONDS", "4"))
-CROWD_TRACK_GRACE_SECONDS = float(
-    os.getenv("CROWD_TRACK_GRACE_SECONDS", "2.5")
-)
-CROWD_SPATIAL_IOU_THRESHOLD = float(
-    os.getenv("CROWD_SPATIAL_IOU_THRESHOLD", "0.25")
-)
-CROWD_CENTER_DISTANCE_RATIO = float(
-    os.getenv("CROWD_CENTER_DISTANCE_RATIO", "0.6")
-)
-CROWD_EVENT_REPEAT_INTERVAL_SECONDS = float(
-    os.getenv("CROWD_EVENT_REPEAT_INTERVAL_SECONDS", "10")
-)
-CROWD_BBOX_PADDING_PERCENT = float(os.getenv("CROWD_BBOX_PADDING_PERCENT", "10"))
-PUBLISH_ALL_PERSON_BBOX = _env_bool("PUBLISH_ALL_PERSON_BBOX", "false")
-BBOX_HEARTBEAT_INTERVAL_SECONDS = float(
-    os.getenv("BBOX_HEARTBEAT_INTERVAL_SECONDS", "0.2")
-)
-BBOX_MAX_STALE_SECONDS = float(os.getenv("BBOX_MAX_STALE_SECONDS", "1.8"))
+# ==============================================================================
+# 4. CẤU HÌNH BBOX REALTIME LÊN WEB VMS (Chỉnh sửa trực tiếp tại đây)
+# ==============================================================================
+PUBLISH_ALL_PERSON_BBOX = True
+BBOX_HEARTBEAT_INTERVAL_SECONDS = 0.15
+BBOX_MAX_STALE_SECONDS = 0.3
+
+# ==============================================================================
+# 5. CẤU HÌNH LOG & DEBUG (Chỉnh sửa trực tiếp tại đây)
+# ==============================================================================
+LOG_LEVEL = "INFO"
+DEBUG_VIDEO_ENABLED = False
+DEBUG_FRAME_SAVE_ENABLED = False
+DEBUG_VIDEO_FPS = 10.0
+DEBUG_MAX_SAVED_FRAMES = 200
+DEBUG_MAX_SAVED_VIDEOS = 10
 
 if CROWD_PERSISTENCE_SECONDS <= 0:
     raise ValueError("CROWD_PERSISTENCE_SECONDS must be greater than 0")
