@@ -723,9 +723,9 @@ def _annotate_bbox_detections(
             label,
             (x1, max(y1 - 8, 0)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.9,
             color,
-            2,
+            3,
             cv2.LINE_AA,
         )
 

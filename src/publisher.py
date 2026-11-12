@@ -57,6 +57,12 @@ def upload_snapshot(jpg: bytes, camera_id: str) -> str | None:
         log.exception("upload ảnh lỗi camera=%s", camera_id)
         return None
 
+def _crowd_severity(person_count: int) -> str:
+    if person_count >= cf.CROWD_SEVERITY_HIGH_MIN_PERSONS:
+        return "HIGH"
+    if person_count >= cf.CROWD_SEVERITY_MEDIUM_MIN_PERSONS:
+        return "MEDIUM"
+    return "LOW"
 
 def publish_crowd_event(
     client: mqtt.Client,
@@ -80,6 +86,11 @@ def publish_crowd_event(
         )
         return False
 
+    largest_cluster = max(
+        (int(c.get("person_count", 0)) for c in crowded_clusters),
+        default=0,
+    )
+
     event = {
         "ai_modules": cf.MODULE,
         "submodule_code": cf.MODULE,
@@ -88,7 +99,7 @@ def publish_crowd_event(
         "event_time": datetime.now(TZ).isoformat(timespec="seconds"),
         "event_type": "CROWD_DETECTION",
         "entity_type": "PERSON",
-        "severity": "HIGH",
+        "severity": _crowd_severity(largest_cluster),
         "payload": {
             "type": "HIGH_DENSITY",
             "person_count": sum(
