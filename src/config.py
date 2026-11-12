@@ -27,7 +27,11 @@ MQTT_PASS = os.environ["MQTT_PASS"]
 MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"].strip()
 MQTT_TLS_ENABLED = False
 
-STORAGE_URL = os.getenv("STORAGE_URL").strip()
+# Cấu hình MinIO S3 Snapshot Upload
+VMS_S3_ENDPOINT = os.getenv("VMS_S3_ENDPOINT", "http://192.168.1.250:18646").strip()
+VMS_S3_BUCKET = os.getenv("VMS_S3_BUCKET", "vms-captures").strip()
+VMS_S3_ACCESS_KEY = os.getenv("VMS_S3_ACCESS_KEY", "atin").strip()
+VMS_S3_SECRET_KEY = os.getenv("VMS_S3_SECRET_KEY", "").strip()
 
 # ==============================================================================
 # 2. CẤU HÌNH MODEL AI & INFERENCE (Chỉnh sửa trực tiếp tại đây)

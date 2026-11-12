@@ -6,55 +6,45 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import paho.mqtt.client as mqtt
-import requests
-from requests.adapters import HTTPAdapter
-
+import uuid
+import boto3
+from botocore.config import Config
 import src.config as cf
 
 log = logging.getLogger("publisher")
 TZ = timezone(timedelta(hours=7))
 _MQTT_PUBLISH_LOCK = threading.Lock()
 
-_http_session = requests.Session()
-_adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16)
-_http_session.mount("http://", _adapter)
-_http_session.mount("https://", _adapter)
+_s3_client = boto3.client(
+    "s3",
+    endpoint_url=cf.VMS_S3_ENDPOINT,
+    aws_access_key_id=cf.VMS_S3_ACCESS_KEY,
+    aws_secret_access_key=cf.VMS_S3_SECRET_KEY,
+    region_name="us-east-1",
+    config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"},
+        connect_timeout=5,
+        read_timeout=15,
+        retries={"max_attempts": 3, "mode": "standard"},
+    ),
+)
 
 
-def upload_snapshot(jpg: bytes, camera_id: str) -> str | None:
+def upload_snapshot(jpg: bytes, camera_id: str, category: str = "crowd") -> str | None:
     try:
-        r = _http_session.post(
-            cf.STORAGE_URL,
-            files={
-                "file": ("snap.jpg", jpg, "image/jpeg"),
-            },
-            data={
-                "camera_id": camera_id,
-                "category": "anomaly",
-            },
-            timeout=10,
+        day = datetime.now(TZ).strftime("%Y-%m-%d")
+        key = f"{category}/{day}/camera_{camera_id}/{uuid.uuid4().hex}.jpg"
+        _s3_client.put_object(
+            Bucket=cf.VMS_S3_BUCKET,
+            Key=key,
+            Body=jpg,
+            ContentType="image/jpeg",
         )
-        r.raise_for_status()
-        response = r.json()
-        object_key = (
-            response.get("object_key") if isinstance(response, dict) else None
-        )
-        if not object_key or response.get("success") is False:
-            log.error(
-                "Storage upload unsuccessful camera=%s status=%s has_object_key=%s",
-                camera_id,
-                r.status_code,
-                bool(object_key),
-            )
-            return None
-        log.info(
-            "Snapshot uploaded camera=%s object_key=%s",
-            camera_id,
-            object_key,
-        )
-        return str(object_key)
+        log.info("S3 Snapshot uploaded camera=%s key=%s", camera_id, key)
+        return key
     except Exception:
-        log.exception("upload ảnh lỗi camera=%s", camera_id)
+        log.exception("Upload ảnh MinIO S3 lỗi camera=%s", camera_id)
         return None
 
 def _crowd_severity(person_count: int) -> str:
@@ -78,7 +68,7 @@ def publish_crowd_event(
         )
         return False
 
-    object_key = upload_snapshot(jpg, cam_id)
+    object_key = upload_snapshot(jpg, cam_id, category="crowd")
     if not object_key:
         log.error(
             "Crowd event not published because snapshot upload failed camera=%s",
