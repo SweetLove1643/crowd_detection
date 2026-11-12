@@ -251,6 +251,7 @@ class PersonDetector:
                 frame,
                 imgsz=self._imgsz,
                 conf=self._confidence,
+                iou=0.9,
                 classes=list(self.person_class_ids),
                 device=self._device,
                 verbose=False,
@@ -272,10 +273,16 @@ class PersonDetector:
     def track(
         self,
         frame: np.ndarray,
+        latest_frame_getter: Any = None,
     ) -> list[tuple[float, float, float, float, float, int | None]]:
         """Return person boxes, confidence, and ByteTrack IDs in frame coordinates."""
         infer_kwargs = self._precision_kwargs()
         with _INFERENCE_SEMAPHORE:
+            if latest_frame_getter is not None:
+                newer_frame = latest_frame_getter()
+                if newer_frame is not None:
+                    frame = newer_frame
+
             predictor = getattr(self._model, "predictor", None)
             if predictor is not None:
                 if self._camera_trackers is not None:
@@ -288,6 +295,7 @@ class PersonDetector:
                 persist=True,
                 tracker="bytetrack.yaml",
                 imgsz=self._imgsz,
+                iou=0.9,
                 conf=self._confidence,
                 classes=list(self.person_class_ids),
                 device=self._device,
@@ -312,6 +320,7 @@ class PersonDetector:
             if boxes.id is not None
             else [None] * len(boxes)
         )
+
         return [
             (float(x1), float(y1), float(x2), float(y2), float(score), track_id)
             for (x1, y1, x2, y2), score, track_id in zip(xyxy, conf, track_ids)

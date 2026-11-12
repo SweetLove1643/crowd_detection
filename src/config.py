@@ -7,11 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Ép FFmpeg đọc RTSP qua TCP (tránh rớt gói UDP gây lỗi HEVC POC/RPS)
-# và tắt log rác không nghiêm trọng từ bộ giải mã C của FFmpeg (AV_LOG_FATAL = 8)
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
-os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "8")
-
 
 def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -30,15 +25,9 @@ MQTT_PATH = os.environ["MQTT_PATH"].strip()
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASS = os.environ["MQTT_PASS"]
 MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"].strip()
-MQTT_TLS_ENABLED = _env_bool(
-    "MQTT_TLS_ENABLED",
-    "true" if MQTT_PORT == 443 else "false",
-)
+MQTT_TLS_ENABLED = False
 
-STORAGE_URL = os.getenv(
-    "STORAGE_URL",
-    "https://aioc.atin.vn/storage/upload/file",
-).strip()
+STORAGE_URL = os.getenv("STORAGE_URL").strip()
 
 # ==============================================================================
 # 2. CẤU HÌNH MODEL AI & INFERENCE (Chỉnh sửa trực tiếp tại đây)
@@ -47,11 +36,11 @@ WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/final.pt"
 OPENVINO_MODEL_PATH = "./resources/runs/train/weights/final_openvino_model"
 YOLO_INFERENCE_BACKEND = "auto"  # "auto" | "pytorch" | "cuda" | "openvino" | "tensorrt"
 YOLO_OPENVINO_DEVICE = "intel:cpu"
-YOLO_IMGSZ = 640
+YOLO_IMGSZ = 896
 YOLO_HALF_PRECISION = True
-YOLO_MODEL_CONF = 0.6
-YOLO_CPU_THREADS = 4
-MAX_CONCURRENT_INFERENCES = 1
+YOLO_MODEL_CONF = 0.55
+YOLO_CPU_THREADS = 6
+MAX_CONCURRENT_INFERENCES = 2
 
 # ==============================================================================
 # 3. CẤU HÌNH ĐÁNH GIÁ KHOẢNG CÁCH & ĐÁM ĐÔNG (Chỉnh sửa trực tiếp tại đây)
@@ -61,19 +50,17 @@ PROXIMITY_Y_SCALE = 1.5
 PROXIMITY_LENGTH_MODE = "max"  # "max" | "height"
 
 NUMBER_PERSON_IS_CROWDED = 5
-CROWD_PERSISTENCE_SECONDS = 4.0
+CROWD_PERSISTENCE_SECONDS = 20.0
 CROWD_TRACK_GRACE_SECONDS = 2.5
 CROWD_SPATIAL_IOU_THRESHOLD = 0.25
 CROWD_CENTER_DISTANCE_RATIO = 0.6
-CROWD_EVENT_REPEAT_INTERVAL_SECONDS = 10.0
+CROWD_EVENT_REPEAT_INTERVAL_SECONDS = 120.0
 CROWD_BBOX_PADDING_PERCENT = 10.0
 
 # ==============================================================================
 # 4. CẤU HÌNH BBOX REALTIME LÊN WEB VMS (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
 PUBLISH_ALL_PERSON_BBOX = True
-BBOX_HEARTBEAT_INTERVAL_SECONDS = 0.15
-BBOX_MAX_STALE_SECONDS = 0.3
 
 # ==============================================================================
 # 5. CẤU HÌNH LOG & DEBUG (Chỉnh sửa trực tiếp tại đây)

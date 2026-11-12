@@ -1,6 +1,8 @@
-# Bước 3: 1 camera = 1 thread đọc RTSP + 1 thread xử lý AI
+# Bước 3: 1 camera = 1 tiến trình FFmpeg đọc RTSP + 1 thread xử lý AI
+import json
 import logging
 import queue
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -20,9 +22,6 @@ from src.publisher import publish_bbox, publish_crowd_event
 
 log = logging.getLogger("camera_worker")
 
-OPEN_TIMEOUT_MS = 5_000
-READ_TIMEOUT_MS = 5_000
-RECONNECT_DELAY_S = 3
 DEBUG_FRAME_SAVE_INTERVAL_S = 5.0
 PERFORMANCE_LOG_INTERVAL_S = 5.0
 DEBUG_VIDEO_FPS = cf.DEBUG_VIDEO_FPS
@@ -36,11 +35,11 @@ PERFORMANCE_STAGES = (
     "read",
     "infer",
     "cluster",
-    "crowd",
     "bbox_build",
+    "bbox_publish",
+    "crowd",
     "annotate",
     "snapshot_encode",
-    "bbox_publish",
     "snapshot_write",
     "video_write",
     "loop",
@@ -284,126 +283,327 @@ class CrowdPersistence:
         return max(max(0.0, now - c.started_at) for c in self._candidates)
 
 
-class LatestFrameGrabber:
-    """Thread chuyên biệt đọc RTSP liên tục, luôn giữ 1 frame mới nhất (độ trễ ~0ms)."""
+def probe_stream(camera: Camera) -> dict[str, object]:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-stimeout",
+            "4000000",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,avg_frame_rate",
+            "-of",
+            "json",
+            camera.rtsp_url,
+        ],
+        capture_output=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"FFprobe could not open camera stream camera={camera.code}"
+        )
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise RuntimeError(f"No video stream found for camera={camera.code}")
+    return streams[0]
+
+
+class FFmpegFrameGrabber:
+    """Đọc RTSP bằng tiến trình FFmpeg độc lập, luôn giữ frame BGR mới nhất (tránh trễ buffer)."""
 
     def __init__(
         self,
         camera: Camera,
         stop_event: threading.Event,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+        startup_timeout: float = 10.0,
+        stall_timeout: float = 3.5,
+        max_frame_age: float = 0.40,
+        reconnect_delay: float = 0.5,
+        decoder: str | None = None,
     ) -> None:
+        if (width is not None and width <= 0) or (
+            height is not None and height <= 0
+        ):
+            raise ValueError("Kích thước frame phải dương")
         self.camera = camera
+        self.width = width
+        self.height = height
         self._stop_event = stop_event
+        self._closed = threading.Event()
         self._cond = threading.Condition()
+        self._thread: threading.Thread | None = None
+        self._watchdog: threading.Thread | None = None
+        self._process: subprocess.Popen[bytes] | None = None
         self._latest_frame: np.ndarray | None = None
         self._latest_seq: int = 0
         self._latest_read_ms: float = 0.0
+        self._last_frame_at: float | None = None
+        self._session_progress_at: float | None = None
+        self._session_has_frames: bool = False
         self._connected: bool = False
-        self._thread: threading.Thread | None = None
+        self._startup_timeout = startup_timeout
+        self._stall_timeout = stall_timeout
+        self._max_frame_age = max_frame_age
+        self._reconnect_delay = reconnect_delay
+        self._decoder = decoder
+        self.sessions = 0
+        self.watchdog_restarts = 0
+        self.reference_errors = 0
+        self.decoder_errors = 0
+
+    def _stopped(self) -> bool:
+        return self._closed.is_set() or self._stop_event.is_set()
 
     def start(self) -> None:
         if self._thread is not None:
             return
         self._thread = threading.Thread(
-            target=self._reader_loop,
+            target=self._read_loop,
             name=f"rtsp-{self.camera.code}",
             daemon=True,
         )
+        self._watchdog = threading.Thread(
+            target=self._watch,
+            name=f"rtsp-watch-{self.camera.code}",
+            daemon=True,
+        )
         self._thread.start()
+        self._watchdog.start()
 
     def stop(self, timeout: float | None = 0.5) -> None:
+        self._closed.set()
         with self._cond:
+            self._kill_process()
             self._cond.notify_all()
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
+        for thread in (self._thread, self._watchdog):
+            if thread is not None:
+                thread.join(timeout=timeout)
+
+    def _fresh(self, last_seq: int) -> bool:
+        return (
+            self._latest_seq > last_seq
+            and self._latest_frame is not None
+            and self._last_frame_at is not None
+            and time.monotonic() - self._last_frame_at <= self._max_frame_age
+        )
 
     def get_latest_frame(
         self,
         last_seq: int,
         timeout: float = 0.2,
     ) -> tuple[int, float, np.ndarray | None]:
-        wait_started = time.perf_counter()
+        began = time.perf_counter()
         with self._cond:
-            if self._latest_seq <= last_seq and not self._stop_event.is_set():
-                self._cond.wait(timeout=timeout)
-            if self._latest_seq <= last_seq or self._latest_frame is None:
+            self._cond.wait_for(
+                lambda: self._stopped() or self._fresh(last_seq),
+                timeout=timeout,
+            )
+            if self._stopped() or not self._fresh(last_seq):
                 return last_seq, 0.0, None
-            seq = self._latest_seq
-            frame = self._latest_frame
-            wait_ms = (time.perf_counter() - wait_started) * 1000
-            return seq, wait_ms, frame
+            return (
+                self._latest_seq,
+                (time.perf_counter() - began) * 1000,
+                self._latest_frame,
+            )
 
-    def _reader_loop(self) -> None:
-        while not self._stop_event.is_set():
-            capture = None
-            try:
-                open_started = time.perf_counter()
-                capture = cv2.VideoCapture(
-                    self.camera.rtsp_url,
-                    cv2.CAP_FFMPEG,
-                    [
-                        cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                        OPEN_TIMEOUT_MS,
-                        cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                        READ_TIMEOUT_MS,
-                    ],
+    def peek_newer_frame(
+        self,
+        current_seq: int,
+    ) -> tuple[int, np.ndarray | None]:
+        with self._cond:
+            if not self._stopped() and self._fresh(current_seq):
+                return self._latest_seq, self._latest_frame
+            return current_seq, None
+
+    def _kill_process(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            self._process.kill()
+
+    def _watch(self) -> None:
+        while not self._closed.wait(0.10):
+            with self._cond:
+                if self._stopped():
+                    self._kill_process()
+                    self._cond.notify_all()
+                    return
+                if (
+                    self._process is None
+                    or self._process.poll() is not None
+                    or self._session_progress_at is None
+                ):
+                    continue
+                limit = (
+                    self._stall_timeout
+                    if self._session_has_frames
+                    else self._startup_timeout
                 )
-                open_ms = (time.perf_counter() - open_started) * 1000
-
-                if not capture.isOpened():
+                if time.monotonic() - self._session_progress_at >= limit:
+                    self.watchdog_restarts += 1
                     log.warning(
-                        "Cannot open RTSP camera=%s open_ms=%.0f",
+                        "FFmpeg watchdog restarting stalled stream camera=%s "
+                        "restarts=%d has_frames=%s",
                         self.camera.code,
-                        open_ms,
+                        self.watchdog_restarts,
+                        self._session_has_frames,
                     )
-                else:
-                    log.info(
-                        "Opened RTSP camera=%s open_ms=%.0f",
-                        self.camera.code,
-                        open_ms,
-                    )
-                    self._connected = True
-                    consecutive_failures = 0
+                    self._kill_process()
 
-                    while not self._stop_event.is_set():
-                        read_started = time.perf_counter()
-                        ok, frame = capture.read()
-                        read_ms = (time.perf_counter() - read_started) * 1000
-
-                        if not ok or frame is None:
-                            consecutive_failures += 1
-                            if consecutive_failures >= 3:
-                                log.warning(
-                                    "Cannot read frame: camera=%s, ok=%s, "
-                                    "frame_is_none=%s read_ms=%.0f",
-                                    self.camera.code,
-                                    ok,
-                                    frame is None,
-                                    read_ms,
-                                )
-                                break
-                            time.sleep(0.05)
-                            continue
-
-                        consecutive_failures = 0
-                        with self._cond:
-                            self._latest_frame = frame
-                            self._latest_seq += 1
-                            self._latest_read_ms = read_ms
-                            self._cond.notify_all()
-
-            except Exception:
-                log.exception(
-                    "RTSP reader exception for camera=%s",
-                    self.camera.code,
+    def _drain_errors(self, pipe) -> None:
+        for line in pipe:
+            if (
+                b"Could not find ref with POC" in line
+                or b"Error constructing the frame RPS" in line
+            ):
+                self.reference_errors += 1
+            if any(
+                term in line
+                for term in (
+                    b"Cannot load lib",
+                    b"Error while opening decoder",
+                    b"CUDA_ERROR",
                 )
-            finally:
-                self._connected = False
-                if capture is not None:
-                    capture.release()
+            ):
+                self.decoder_errors += 1
 
-            if not self._stop_event.is_set():
-                self._stop_event.wait(RECONNECT_DELAY_S)
+    def _command(self) -> list[str]:
+        decoder = ["-c:v", self._decoder] if self._decoder else []
+        return [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rtsp_transport",
+            "tcp",
+            "-stimeout",
+            "4000000",
+            "-threads",
+            "2",
+            *decoder,
+            "-i",
+            self.camera.rtsp_url,
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            f"scale={self.width}:{self.height}:flags=fast_bilinear",
+            "-vsync",
+            "0",
+            "-c:v",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-threads:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ]
+
+    def _store_frame(self, frame: np.ndarray, read_ms: float) -> None:
+        with self._cond:
+            now = time.monotonic()
+            self._latest_frame = frame
+            self._latest_seq += 1
+            self._latest_read_ms = read_ms
+            self._last_frame_at = self._session_progress_at = now
+            self._session_has_frames = self._connected = True
+            self._cond.notify_all()
+
+    def _ensure_dimensions(self) -> bool:
+        if self.width and self.height:
+            return True
+        try:
+            stream = probe_stream(self.camera)
+            width = int(stream["width"])
+            height = int(stream["height"])
+            if width <= 0 or height <= 0:
+                raise ValueError(f"Invalid stream size {width}x{height}")
+            self.width = width
+            self.height = height
+            log.info(
+                "Opened RTSP stream info camera=%s size=%dx%d codec=%s fps=%s",
+                self.camera.code,
+                self.width,
+                self.height,
+                stream.get("codec_name"),
+                stream.get("avg_frame_rate"),
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "Cannot probe RTSP camera=%s: %s",
+                self.camera.code,
+                exc,
+            )
+            return False
+
+    def _read_loop(self) -> None:
+        while not self._stopped():
+            if not self._ensure_dimensions():
+                self._closed.wait(self._reconnect_delay)
+                continue
+
+            assert self.width is not None and self.height is not None
+            process = subprocess.Popen(
+                self._command(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            with self._cond:
+                self._process = process
+                self.sessions += 1
+                self._session_progress_at = time.monotonic()
+                self._session_has_frames = False
+                if self._stopped():
+                    self._kill_process()
+            stderr_reader = threading.Thread(
+                target=self._drain_errors,
+                args=(process.stderr,),
+                daemon=True,
+            )
+            stderr_reader.start()
+            try:
+                while not self._stopped() and process.stdout is not None:
+                    began = time.perf_counter()
+                    frame = np.empty(
+                        (self.height, self.width, 3),
+                        dtype=np.uint8,
+                    )
+                    count = process.stdout.readinto(
+                        memoryview(frame).cast("B")
+                    )
+                    if count != frame.nbytes:
+                        break
+                    self._store_frame(
+                        frame,
+                        (time.perf_counter() - began) * 1000,
+                    )
+            finally:
+                with self._cond:
+                    self._kill_process()
+                    self._process = None
+                    self._latest_frame = None
+                    self._connected = False
+                    self._cond.notify_all()
+                process.wait()
+                if process.stdout is not None:
+                    process.stdout.close()
+                stderr_reader.join(1)
+                if process.stderr is not None:
+                    process.stderr.close()
+            self._closed.wait(self._reconnect_delay)
 
 
 def _build_bbox_detections(
@@ -435,13 +635,14 @@ def _build_bbox_detections(
 
         x1, y1, x2, y2, confidence, track_id = detection
         person_id = (
-            f"person_{track_id}"
+            f"Người_{track_id}"
             if track_id is not None
-            else f"person_{detection_index}"
+            else f"Người_{detection_index}"
         )
         person_bbox: dict[str, object] = {
             "id": person_id,
-            "label": f"{person_id} {confidence:.2f}",
+            "label": f"Người",
+            # "label": f"{person_id} {confidence:.2f}",
             "class": "person",
             "confidence": round(confidence, 4),
             "bbox": [
@@ -473,7 +674,7 @@ def _build_bbox_detections(
         bbox_detections.append(
             {
                 "id": f"crowd_{cluster_index + 1}",
-                "label": f"crowd_{cluster_index + 1} ({len(cluster)} people)",
+                "label": f"Cụm {cluster_index + 1} ({len(cluster)} người)",
                 "class": "crowd",
                 "bbox": [
                     round(x1 / frame_width, 6),
@@ -541,9 +742,9 @@ def _annotate_bbox_detections(
             (x1, y1, x2, y2),
             CROWD_COLOR_BGR if is_crowd_member else PERSON_COLOR_BGR,
             (
-                f"person_{track_id}"
+                f"Người_{track_id}"
                 if track_id is not None
-                else f"person_{detection_index}"
+                else f"Người_{detection_index}"
             )
             + f" {confidence:.2f}",
         )
@@ -564,7 +765,7 @@ def _annotate_bbox_detections(
                 min(frame.shape[0], y2 + pad_y),
             ),
             CROWD_COLOR_BGR,
-            f"crowd_{cluster_index + 1} ({len(cluster)} people)",
+            f"Cụm {cluster_index + 1} ({len(cluster)} người)",
         )
 
     cv2.putText(
@@ -648,11 +849,6 @@ class CameraWorker:
         self.client = client
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._bbox_lock = threading.Lock()
-        self._latest_bbox_state: tuple[
-            list[dict[str, object]], str, str, float
-        ] | None = None
-        self._heartbeat_thread: threading.Thread | None = None
 
     def signal_stop(self) -> None:
         """Gửi tín hiệu dừng không chặn (non-blocking) cho worker."""
@@ -667,19 +863,10 @@ class CameraWorker:
             name=f"camera-{self.camera.code}",
             daemon=True,
         )
-        self._heartbeat_thread = threading.Thread(
-            target=self._bbox_heartbeat_loop,
-            name=f"bbox-hb-{self.camera.code}",
-            daemon=True,
-        )
         self._thread.start()
-        self._heartbeat_thread.start()
 
     def stop(self, timeout: float | None = 7) -> None:
         self._stop_event.set()
-
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join(timeout=1.0)
 
         if self._thread is None:
             return
@@ -693,30 +880,8 @@ class CameraWorker:
                 timeout,
             )
 
-    def _bbox_heartbeat_loop(self) -> None:
-        """Giữ khung BBox trên Web VMS không bị nhấp nháy khi có người và FPS < 5."""
-        interval = max(0.1, cf.BBOX_HEARTBEAT_INTERVAL_SECONDS)
-        max_stale = max(interval, cf.BBOX_MAX_STALE_SECONDS)
-        while not self._stop_event.wait(interval):
-            with self._bbox_lock:
-                state = self._latest_bbox_state
-            if state is None:
-                continue
-            detections, hud_text, hud_color, updated_at = state
-            if not detections:
-                continue
-            age = time.monotonic() - updated_at
-            if interval <= age <= max_stale:
-                publish_bbox(
-                    self.client,
-                    self.camera.id,
-                    self.camera.code,
-                    detections,
-                    hud_text,
-                    hud_color,
-                )
-
     def _run(self) -> None:
+        cv2.setNumThreads(1)
         weight_path = Path(cf.WEIGHT_YOLO_MODEL_PATH)
         confidence = float(cf.YOLO_MODEL_CONF)
 
@@ -726,7 +891,7 @@ class CameraWorker:
         )
         analyzer = ProximityEvaluator()
         crowd_persistence = CrowdPersistence(cf.CROWD_PERSISTENCE_SECONDS)
-        grabber = LatestFrameGrabber(self.camera, self._stop_event)
+        grabber = FFmpegFrameGrabber(self.camera, self._stop_event)
         grabber.start()
 
         was_crowded = False
@@ -839,7 +1004,20 @@ class CameraWorker:
                 inference_started = time.perf_counter()
                 if self._stop_event.is_set():
                     break
-                dets = detector.track(frame)
+
+                def _refresh_latest_frame() -> np.ndarray | None:
+                    nonlocal last_seq, frame
+                    newer_seq, newer_frame = grabber.peek_newer_frame(last_seq)
+                    if newer_frame is not None and newer_seq > last_seq:
+                        last_seq = newer_seq
+                        frame = newer_frame
+                        return newer_frame
+                    return None
+
+                dets = detector.track(
+                    frame,
+                    latest_frame_getter=_refresh_latest_frame,
+                )
                 if self._stop_event.is_set():
                     break
                 inference_ms = (time.perf_counter() - inference_started) * 1000
@@ -853,6 +1031,44 @@ class CameraWorker:
                 ]
                 is_crowded = bool(crowded_clusters)
                 cluster_ms = (time.perf_counter() - cluster_started) * 1000
+
+                frame_height, frame_width = frame.shape[:2]
+                bbox_build_started = time.perf_counter()
+                bbox_detections = _build_bbox_detections(
+                    dets,
+                    clusters,
+                    crowded_clusters,
+                    frame_width,
+                    frame_height,
+                    cf.PUBLISH_ALL_PERSON_BBOX,
+                    cf.CROWD_BBOX_PADDING_PERCENT,
+                )
+                bbox_build_ms = (
+                    time.perf_counter() - bbox_build_started
+                ) * 1000
+
+                hud_text = (
+                    f"Số đám đông: {len(crowded_clusters)} cụm"
+                    if is_crowded
+                    else f"Số người phát hiện: {len(dets)}"
+                )
+                hud_color = CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX
+                bbox_publish_started = time.perf_counter()
+                bbox_published = publish_bbox(
+                    self.client,
+                    self.camera.id,
+                    self.camera.code,
+                    bbox_detections,
+                    hud_text,
+                    hud_color,
+                )
+                bbox_publish_ms = (
+                    time.perf_counter() - bbox_publish_started
+                ) * 1000
+
+                frame_count += 1
+                bbox_publish_count += 1
+                bbox_publish_success_count += int(bbox_published)
 
                 now = time.monotonic()
                 crowd_started = time.perf_counter()
@@ -914,21 +1130,6 @@ class CameraWorker:
                 elif was_crowded and not has_candidates:
                     log.info("Crowd cleared camera=%s", self.camera.code)
                     was_crowded = False
-
-                frame_height, frame_width = frame.shape[:2]
-                bbox_build_started = time.perf_counter()
-                bbox_detections = _build_bbox_detections(
-                    dets,
-                    clusters,
-                    crowded_clusters,
-                    frame_width,
-                    frame_height,
-                    cf.PUBLISH_ALL_PERSON_BBOX,
-                    cf.CROWD_BBOX_PADDING_PERCENT,
-                )
-                bbox_build_ms = (
-                    time.perf_counter() - bbox_build_started
-                ) * 1000
 
                 snapshot_due = (
                     cf.DEBUG_FRAME_SAVE_ENABLED
@@ -1045,36 +1246,6 @@ class CameraWorker:
                             self.camera.code,
                             len(ready_clusters),
                         )
-
-                hud_text = (
-                    f"CROWD: {len(crowded_clusters)} cluster(s)"
-                    if is_crowded
-                    else f"People: {len(dets)}"
-                )
-                hud_color = CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX
-                bbox_publish_started = time.perf_counter()
-                bbox_published = publish_bbox(
-                    self.client,
-                    self.camera.id,
-                    self.camera.code,
-                    bbox_detections,
-                    hud_text,
-                    hud_color,
-                )
-                with self._bbox_lock:
-                    self._latest_bbox_state = (
-                        bbox_detections,
-                        hud_text,
-                        hud_color,
-                        time.monotonic(),
-                    )
-                bbox_publish_ms = (
-                    time.perf_counter() - bbox_publish_started
-                ) * 1000
-
-                frame_count += 1
-                bbox_publish_count += 1
-                bbox_publish_success_count += int(bbox_published)
 
                 if snapshot_due:
                     snapshot_write_started = time.perf_counter()
