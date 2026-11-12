@@ -18,6 +18,7 @@ _TORCH_RUNTIME_LOCK = threading.Lock()
 _TORCH_RUNTIME_CONFIGURED = False
 _INFERENCE_SEMAPHORE = threading.Semaphore(cf.MAX_CONCURRENT_INFERENCES)
 _SHARED_MODEL_LOCK = threading.Lock()
+_MODEL_INFERENCE_LOCK = threading.Lock()
 _SHARED_MODELS: dict[tuple[str, str, str, int, bool], tuple[YOLO, dict | list]] = {}
 
 
@@ -217,15 +218,12 @@ class PersonDetector:
         with _TORCH_RUNTIME_LOCK:
             if _TORCH_RUNTIME_CONFIGURED:
                 return
-            if self._device == "cpu" or self._backend == "openvino":
-                torch.set_num_threads(cf.YOLO_CPU_THREADS)
-            elif torch.cuda.is_available():
+            torch.set_num_threads(cf.YOLO_CPU_THREADS)
+            if torch.cuda.is_available():
                 torch.backends.cudnn.benchmark = True
             _TORCH_RUNTIME_CONFIGURED = True
 
     def _restore_torch_runtime(self) -> None:
-        if self._device != "cpu" and self._backend != "openvino":
-            return
         if torch.get_num_threads() == cf.YOLO_CPU_THREADS:
             return
 
@@ -246,7 +244,7 @@ class PersonDetector:
     ) -> list[tuple[float, float, float, float, float]]:
         """Trả về list (x1, y1, x2, y2, conf) theo toạ độ frame gốc."""
         infer_kwargs = self._precision_kwargs()
-        with _INFERENCE_SEMAPHORE:
+        with _INFERENCE_SEMAPHORE, _MODEL_INFERENCE_LOCK:
             result = self._model.predict(
                 frame,
                 imgsz=self._imgsz,
@@ -277,7 +275,7 @@ class PersonDetector:
     ) -> list[tuple[float, float, float, float, float, int | None]]:
         """Return person boxes, confidence, and ByteTrack IDs in frame coordinates."""
         infer_kwargs = self._precision_kwargs()
-        with _INFERENCE_SEMAPHORE:
+        with _INFERENCE_SEMAPHORE, _MODEL_INFERENCE_LOCK:
             if latest_frame_getter is not None:
                 newer_frame = latest_frame_getter()
                 if newer_frame is not None:
@@ -305,7 +303,7 @@ class PersonDetector:
 
             predictor = getattr(self._model, "predictor", None)
             if predictor is not None and hasattr(predictor, "trackers"):
-                self._camera_trackers = predictor.trackers
+                self._camera_trackers = list(predictor.trackers)
 
             self._restore_torch_runtime()
 

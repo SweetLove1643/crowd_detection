@@ -884,488 +884,527 @@ class CameraWorker:
         cv2.setNumThreads(1)
         weight_path = Path(cf.WEIGHT_YOLO_MODEL_PATH)
         confidence = float(cf.YOLO_MODEL_CONF)
-
-        detector = PersonDetector(
-            weights_path=weight_path,
-            confidence=confidence,
-        )
-        analyzer = ProximityEvaluator()
-        crowd_persistence = CrowdPersistence(cf.CROWD_PERSISTENCE_SECONDS)
-        grabber = FFmpegFrameGrabber(self.camera, self._stop_event)
-        grabber.start()
-
-        was_crowded = False
-        last_cluster_log_time = 0.0
-        last_snapshot_time = 0.0
-        last_performance_log_time = time.monotonic()
-        last_frame_time: float | None = None
-        last_seq = 0
-        frame_count = 0
-        bbox_publish_count = 0
-        bbox_publish_success_count = 0
-        stage_totals_ms = {stage: 0.0 for stage in PERFORMANCE_STAGES}
-        stage_max_ms = {stage: 0.0 for stage in PERFORMANCE_STAGES}
-        stage_counts = {stage: 0 for stage in PERFORMANCE_STAGES}
-        publish_results: queue.Queue[tuple[set[int], bool]] = queue.Queue()
-
-        image_save_dir = (
-            Path(__file__).resolve().parents[1] / "resources" / "img_test"
-        )
-        debug_video_dir = (
-            Path(__file__).resolve().parents[1] / "resources" / "debug_videos"
-        )
-        if cf.DEBUG_FRAME_SAVE_ENABLED:
-            image_save_dir.mkdir(parents=True, exist_ok=True)
-            _prune_old_files(
-                image_save_dir, "*.jpg", cf.DEBUG_MAX_SAVED_FRAMES
-            )
-        if cf.DEBUG_VIDEO_ENABLED:
-            debug_video_dir.mkdir(parents=True, exist_ok=True)
-            _prune_old_files(
-                debug_video_dir, "*.mp4", cf.DEBUG_MAX_SAVED_VIDEOS
-            )
+        grabber: FFmpegFrameGrabber | None = None
         debug_writer = None
         debug_video_frame_count = 0
         debug_video_disabled = False
         debug_video_path: Path | None = None
 
-        log.info(
-            "Processing options camera=%s cpu_threads=%d debug_video=%s "
-            "debug_snapshots=%s",
-            self.camera.code,
-            torch.get_num_threads(),
-            cf.DEBUG_VIDEO_ENABLED,
-            cf.DEBUG_FRAME_SAVE_ENABLED,
-        )
-
         try:
-            while not self._stop_event.is_set():
-                frame_loop_started = time.perf_counter()
-                seq, read_ms, frame = grabber.get_latest_frame(
-                    last_seq,
-                    timeout=0.5,
-                )
-                if frame is None or seq == last_seq:
-                    continue
-                last_seq = seq
+            detector = PersonDetector(
+                weights_path=weight_path,
+                confidence=confidence,
+            )
+            analyzer = ProximityEvaluator()
+            crowd_persistence = CrowdPersistence(cf.CROWD_PERSISTENCE_SECONDS)
+            grabber = FFmpegFrameGrabber(self.camera, self._stop_event)
+            grabber.start()
 
-                if (
-                    cf.DEBUG_VIDEO_ENABLED
-                    and debug_writer is None
-                    and not debug_video_disabled
-                ):
-                    safe_camera_code = "".join(
-                        char if char.isalnum() or char in "-_" else "_"
-                        for char in self.camera.code
-                    )
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                    debug_video_path = (
-                        debug_video_dir / f"{safe_camera_code}_{timestamp}.mp4"
-                    )
-                    frame_height, frame_width = frame.shape[:2]
-                    debug_writer = cv2.VideoWriter(
-                        str(debug_video_path),
-                        cv2.VideoWriter_fourcc(*"mp4v"),
-                        DEBUG_VIDEO_FPS,
-                        (frame_width, frame_height),
-                    )
-                    if debug_writer.isOpened():
-                        log.info(
-                            "Debug video started camera=%s path=%s "
-                            "fps=%.1f size=%dx%d codec=mp4v",
-                            self.camera.code,
-                            debug_video_path,
-                            DEBUG_VIDEO_FPS,
+            was_crowded = False
+            last_cluster_log_time = 0.0
+            last_snapshot_time = 0.0
+            last_performance_log_time = time.monotonic()
+            last_frame_time: float | None = None
+            last_seq = 0
+            frame_count = 0
+            bbox_publish_count = 0
+            bbox_publish_success_count = 0
+            stage_totals_ms = {stage: 0.0 for stage in PERFORMANCE_STAGES}
+            stage_max_ms = {stage: 0.0 for stage in PERFORMANCE_STAGES}
+            stage_counts = {stage: 0 for stage in PERFORMANCE_STAGES}
+            publish_results: queue.Queue[tuple[set[int], bool]] = queue.Queue()
+
+            image_save_dir = (
+                Path(__file__).resolve().parents[1] / "resources" / "img_test"
+            )
+            debug_video_dir = (
+                Path(__file__).resolve().parents[1]
+                / "resources"
+                / "debug_videos"
+            )
+            if cf.DEBUG_FRAME_SAVE_ENABLED:
+                image_save_dir.mkdir(parents=True, exist_ok=True)
+                _prune_old_files(
+                    image_save_dir, "*.jpg", cf.DEBUG_MAX_SAVED_FRAMES
+                )
+            if cf.DEBUG_VIDEO_ENABLED:
+                debug_video_dir.mkdir(parents=True, exist_ok=True)
+                _prune_old_files(
+                    debug_video_dir, "*.mp4", cf.DEBUG_MAX_SAVED_VIDEOS
+                )
+
+            log.info(
+                "Processing options camera=%s cpu_threads=%d debug_video=%s "
+                "debug_snapshots=%s",
+                self.camera.code,
+                torch.get_num_threads(),
+                cf.DEBUG_VIDEO_ENABLED,
+                cf.DEBUG_FRAME_SAVE_ENABLED,
+            )
+
+            while not self._stop_event.is_set():
+                try:
+                    while not self._stop_event.is_set():
+                        frame_loop_started = time.perf_counter()
+                        seq, read_ms, frame = grabber.get_latest_frame(
+                            last_seq,
+                            timeout=0.5,
+                        )
+                        if frame is None or seq == last_seq:
+                            continue
+                        last_seq = seq
+
+                        if (
+                            cf.DEBUG_VIDEO_ENABLED
+                            and debug_writer is None
+                            and not debug_video_disabled
+                        ):
+                            safe_camera_code = "".join(
+                                char if char.isalnum() or char in "-_" else "_"
+                                for char in self.camera.code
+                            )
+                            timestamp = datetime.now().strftime(
+                                "%Y%m%d_%H%M%S_%f"
+                            )[:-3]
+                            debug_video_path = (
+                                debug_video_dir
+                                / f"{safe_camera_code}_{timestamp}.mp4"
+                            )
+                            frame_height, frame_width = frame.shape[:2]
+                            debug_writer = cv2.VideoWriter(
+                                str(debug_video_path),
+                                cv2.VideoWriter_fourcc(*"mp4v"),
+                                DEBUG_VIDEO_FPS,
+                                (frame_width, frame_height),
+                            )
+                            if debug_writer.isOpened():
+                                log.info(
+                                    "Debug video started camera=%s path=%s "
+                                    "fps=%.1f size=%dx%d codec=mp4v",
+                                    self.camera.code,
+                                    debug_video_path,
+                                    DEBUG_VIDEO_FPS,
+                                    frame_width,
+                                    frame_height,
+                                )
+                            else:
+                                log.error(
+                                    "Cannot create debug video camera=%s path=%s",
+                                    self.camera.code,
+                                    debug_video_path,
+                                )
+                                debug_writer.release()
+                                debug_writer = None
+                                debug_video_disabled = True
+
+                        frame_started_at = time.monotonic()
+                        frame_interval_s = (
+                            frame_started_at - last_frame_time
+                            if last_frame_time is not None
+                            and frame_started_at > last_frame_time
+                            else 0.0
+                        )
+                        processing_fps = (
+                            1.0 / frame_interval_s
+                            if frame_interval_s > 0.0
+                            else 0.0
+                        )
+                        last_frame_time = frame_started_at
+
+                        inference_started = time.perf_counter()
+                        if self._stop_event.is_set():
+                            break
+
+                        def _refresh_latest_frame() -> np.ndarray | None:
+                            nonlocal last_seq, frame
+                            newer_seq, newer_frame = grabber.peek_newer_frame(
+                                last_seq
+                            )
+                            if newer_frame is not None and newer_seq > last_seq:
+                                last_seq = newer_seq
+                                frame = newer_frame
+                                return newer_frame
+                            return None
+
+                        dets = detector.track(
+                            frame,
+                            latest_frame_getter=_refresh_latest_frame,
+                        )
+                        if self._stop_event.is_set():
+                            break
+                        inference_ms = (
+                            time.perf_counter() - inference_started
+                        ) * 1000
+
+                        cluster_started = time.perf_counter()
+                        clusters = analyzer.clusters(dets)
+                        crowded_clusters = [
+                            (cluster_index, cluster)
+                            for cluster_index, cluster in enumerate(clusters)
+                            if len(cluster) >= cf.NUMBER_PERSON_IS_CROWDED
+                        ]
+                        is_crowded = bool(crowded_clusters)
+                        cluster_ms = (
+                            time.perf_counter() - cluster_started
+                        ) * 1000
+
+                        frame_height, frame_width = frame.shape[:2]
+                        bbox_build_started = time.perf_counter()
+                        bbox_detections = _build_bbox_detections(
+                            dets,
+                            clusters,
+                            crowded_clusters,
                             frame_width,
                             frame_height,
+                            cf.PUBLISH_ALL_PERSON_BBOX,
+                            cf.CROWD_BBOX_PADDING_PERCENT,
                         )
-                    else:
-                        log.error(
-                            "Cannot create debug video camera=%s path=%s",
+                        bbox_build_ms = (
+                            time.perf_counter() - bbox_build_started
+                        ) * 1000
+
+                        hud_text = (
+                            f"Số đám đông: {len(crowded_clusters)} cụm"
+                            if is_crowded
+                            else f"Số người phát hiện: {len(dets)}"
+                        )
+                        hud_color = (
+                            CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX
+                        )
+                        bbox_publish_started = time.perf_counter()
+                        bbox_published = publish_bbox(
+                            self.client,
+                            self.camera.id,
                             self.camera.code,
-                            debug_video_path,
+                            bbox_detections,
+                            hud_text,
+                            hud_color,
                         )
-                        debug_writer.release()
-                        debug_writer = None
-                        debug_video_disabled = True
+                        bbox_publish_ms = (
+                            time.perf_counter() - bbox_publish_started
+                        ) * 1000
 
-                frame_started_at = time.monotonic()
-                frame_interval_s = (
-                    frame_started_at - last_frame_time
-                    if last_frame_time is not None
-                    and frame_started_at > last_frame_time
-                    else 0.0
-                )
-                processing_fps = (
-                    1.0 / frame_interval_s if frame_interval_s > 0.0 else 0.0
-                )
-                last_frame_time = frame_started_at
+                        frame_count += 1
+                        bbox_publish_count += 1
+                        bbox_publish_success_count += int(bbox_published)
 
-                inference_started = time.perf_counter()
-                if self._stop_event.is_set():
-                    break
-
-                def _refresh_latest_frame() -> np.ndarray | None:
-                    nonlocal last_seq, frame
-                    newer_seq, newer_frame = grabber.peek_newer_frame(last_seq)
-                    if newer_frame is not None and newer_seq > last_seq:
-                        last_seq = newer_seq
-                        frame = newer_frame
-                        return newer_frame
-                    return None
-
-                dets = detector.track(
-                    frame,
-                    latest_frame_getter=_refresh_latest_frame,
-                )
-                if self._stop_event.is_set():
-                    break
-                inference_ms = (time.perf_counter() - inference_started) * 1000
-
-                cluster_started = time.perf_counter()
-                clusters = analyzer.clusters(dets)
-                crowded_clusters = [
-                    (cluster_index, cluster)
-                    for cluster_index, cluster in enumerate(clusters)
-                    if len(cluster) >= cf.NUMBER_PERSON_IS_CROWDED
-                ]
-                is_crowded = bool(crowded_clusters)
-                cluster_ms = (time.perf_counter() - cluster_started) * 1000
-
-                frame_height, frame_width = frame.shape[:2]
-                bbox_build_started = time.perf_counter()
-                bbox_detections = _build_bbox_detections(
-                    dets,
-                    clusters,
-                    crowded_clusters,
-                    frame_width,
-                    frame_height,
-                    cf.PUBLISH_ALL_PERSON_BBOX,
-                    cf.CROWD_BBOX_PADDING_PERCENT,
-                )
-                bbox_build_ms = (
-                    time.perf_counter() - bbox_build_started
-                ) * 1000
-
-                hud_text = (
-                    f"Số đám đông: {len(crowded_clusters)} cụm"
-                    if is_crowded
-                    else f"Số người phát hiện: {len(dets)}"
-                )
-                hud_color = CROWD_COLOR_HEX if is_crowded else PERSON_COLOR_HEX
-                bbox_publish_started = time.perf_counter()
-                bbox_published = publish_bbox(
-                    self.client,
-                    self.camera.id,
-                    self.camera.code,
-                    bbox_detections,
-                    hud_text,
-                    hud_color,
-                )
-                bbox_publish_ms = (
-                    time.perf_counter() - bbox_publish_started
-                ) * 1000
-
-                frame_count += 1
-                bbox_publish_count += 1
-                bbox_publish_success_count += int(bbox_published)
-
-                now = time.monotonic()
-                crowd_started = time.perf_counter()
-                while True:
-                    try:
-                        published_track_ids, publish_succeeded = (
-                            publish_results.get_nowait()
-                        )
-                    except queue.Empty:
-                        break
-                    crowd_persistence.complete_publish(
-                        published_track_ids,
-                        publish_succeeded,
-                        now,
-                    )
-                ready_clusters = crowd_persistence.update(
-                    crowded_clusters,
-                    dets,
-                    now,
-                    frame_interval_s=frame_interval_s,
-                )
-                crowd_ms = (time.perf_counter() - crowd_started) * 1000
-
-                if now - last_cluster_log_time >= 1.0:
-                    cluster_details = [
-                        {
-                            "cluster": cluster_index + 1,
-                            "people": len(cluster),
-                            "detections": cluster,
-                            "crowd": len(cluster)
-                            >= cf.NUMBER_PERSON_IS_CROWDED,
-                            "track_ids": [
-                                dets[index][5]
-                                for index in cluster
-                                if dets[index][5] is not None
-                            ],
-                        }
-                        for cluster_index, cluster in enumerate(clusters)
-                    ]
-                    log.info(
-                        "Cluster summary camera=%s people=%d clusters=%d "
-                        "crowd_threshold>=%d details=%s",
-                        self.camera.code,
-                        len(dets),
-                        len(clusters),
-                        cf.NUMBER_PERSON_IS_CROWDED,
-                        cluster_details,
-                    )
-                    last_cluster_log_time = now
-
-                has_candidates = crowd_persistence.has_active_candidates()
-                if is_crowded and not was_crowded:
-                    log.info(
-                        "Crowd candidate detected camera=%s; waiting %.1fs persistence",
-                        self.camera.code,
-                        cf.CROWD_PERSISTENCE_SECONDS,
-                    )
-                    was_crowded = True
-                elif was_crowded and not has_candidates:
-                    log.info("Crowd cleared camera=%s", self.camera.code)
-                    was_crowded = False
-
-                snapshot_due = (
-                    cf.DEBUG_FRAME_SAVE_ENABLED
-                    and now - last_snapshot_time >= DEBUG_FRAME_SAVE_INTERVAL_S
-                )
-                needs_annotated_frame = (
-                    cf.DEBUG_VIDEO_ENABLED
-                    or snapshot_due
-                    or bool(ready_clusters)
-                )
-                annotate_ms = 0.0
-                debug_frame = None
-                if needs_annotated_frame:
-                    annotate_started = time.perf_counter()
-                    debug_frame = _annotate_bbox_detections(
-                        frame,
-                        dets,
-                        crowded_clusters,
-                        cf.CROWD_BBOX_PADDING_PERCENT,
-                        inference_ms,
-                        processing_fps,
-                    )
-                    debug_frame = _validate_debug_frame(
-                        debug_frame,
-                        "debug output",
-                    )
-                    annotate_ms = (
-                        time.perf_counter() - annotate_started
-                    ) * 1000
-
-                snapshot_bytes = None
-                snapshot_encode_ms = 0.0
-                if snapshot_due or ready_clusters:
-                    snapshot_encode_started = time.perf_counter()
-                    try:
-                        if debug_frame is None:
-                            raise RuntimeError(
-                                "Annotated frame missing for snapshot"
+                        now = time.monotonic()
+                        crowd_started = time.perf_counter()
+                        while True:
+                            try:
+                                published_track_ids, publish_succeeded = (
+                                    publish_results.get_nowait()
+                                )
+                            except queue.Empty:
+                                break
+                            crowd_persistence.complete_publish(
+                                published_track_ids,
+                                publish_succeeded,
+                                now,
                             )
-                        encoded, snapshot_buffer = cv2.imencode(
-                            ".jpg",
-                            debug_frame,
-                            [cv2.IMWRITE_JPEG_QUALITY, 90],
-                        )
-                        if encoded and snapshot_buffer.size:
-                            snapshot_bytes = snapshot_buffer.tobytes()
-                        else:
-                            log.error(
-                                "Failed to encode snapshot camera=%s frame=%s",
-                                self.camera.code,
-                                _frame_description(debug_frame),
-                            )
-                    except (cv2.error, RuntimeError):
-                        log.exception(
-                            "Failed to encode snapshot camera=%s frame=%s",
-                            self.camera.code,
-                            _frame_description(debug_frame)
-                            if debug_frame is not None
-                            else "missing",
-                        )
-                    snapshot_encode_ms = (
-                        time.perf_counter() - snapshot_encode_started
-                    ) * 1000
-                    stage_totals_ms["snapshot_encode"] += snapshot_encode_ms
-                    stage_max_ms["snapshot_encode"] = max(
-                        stage_max_ms["snapshot_encode"],
-                        snapshot_encode_ms,
-                    )
-                    stage_counts["snapshot_encode"] += 1
-
-                if ready_clusters:
-                    log.warning(
-                        "Persistent crowd detected camera=%s duration=%.1fs clusters=%s",
-                        self.camera.code,
-                        cf.CROWD_PERSISTENCE_SECONDS,
-                        [cluster for _, cluster, _ in ready_clusters],
-                    )
-                    event_track_ids = set().union(
-                        *(track_ids for _, _, track_ids in ready_clusters)
-                    )
-                    event_scheduled = _publish_crowd_event_async(
-                        self.client,
-                        self.camera.id,
-                        self.camera.code,
-                        [
-                            {
-                                "cluster_id": cluster_index + 1,
-                                "person_count": len(cluster),
-                                "detections": cluster,
-                                "track_ids": sorted(
-                                    t for t in track_ids if t >= 0
-                                ),
-                            }
-                            for cluster_index, cluster, track_ids in ready_clusters
-                        ],
-                        snapshot_jpg=snapshot_bytes,
-                        track_ids=event_track_ids,
-                        result_queue=publish_results,
-                    )
-                    if not event_scheduled:
-                        crowd_persistence.complete_publish(
-                            event_track_ids,
-                            False,
+                        ready_clusters = crowd_persistence.update(
+                            crowded_clusters,
+                            dets,
                             now,
+                            frame_interval_s=frame_interval_s,
                         )
-                        log.error(
-                            "Crowd event was not scheduled camera=%s; "
-                            "will retry while crowd persists",
-                            self.camera.code,
-                        )
-                    else:
-                        log.info(
-                            "Crowd event publishing started camera=%s clusters=%d",
-                            self.camera.code,
-                            len(ready_clusters),
-                        )
+                        crowd_ms = (time.perf_counter() - crowd_started) * 1000
 
-                if snapshot_due:
-                    snapshot_write_started = time.perf_counter()
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-                    safe_camera_code = "".join(
-                        char if char.isalnum() or char in "-_" else "_"
-                        for char in self.camera.code
-                    )
-                    img_path = image_save_dir / f"{safe_camera_code}_{ts}.jpg"
-                    if snapshot_bytes is None:
-                        log.error(
-                            "Skipping debug snapshot because JPEG encoding "
-                            "failed camera=%s path=%s",
-                            self.camera.code,
-                            img_path,
-                        )
-                    else:
-                        try:
-                            img_path.write_bytes(snapshot_bytes)
-                            _prune_old_files(
-                                image_save_dir,
-                                "*.jpg",
-                                cf.DEBUG_MAX_SAVED_FRAMES,
-                            )
-                        except OSError:
-                            log.exception(
-                                "Failed to save debug snapshot camera=%s "
-                                "path=%s frame=%s",
+                        if now - last_cluster_log_time >= 1.0:
+                            cluster_details = [
+                                {
+                                    "cluster": cluster_index + 1,
+                                    "people": len(cluster),
+                                    "detections": cluster,
+                                    "crowd": len(cluster)
+                                    >= cf.NUMBER_PERSON_IS_CROWDED,
+                                    "track_ids": [
+                                        dets[index][5]
+                                        for index in cluster
+                                        if dets[index][5] is not None
+                                    ],
+                                }
+                                for cluster_index, cluster in enumerate(
+                                    clusters
+                                )
+                            ]
+                            log.info(
+                                "Cluster summary camera=%s people=%d clusters=%d "
+                                "crowd_threshold>=%d details=%s",
                                 self.camera.code,
-                                img_path,
-                                _frame_description(debug_frame)
-                                if debug_frame is not None
-                                else "missing",
+                                len(dets),
+                                len(clusters),
+                                cf.NUMBER_PERSON_IS_CROWDED,
+                                cluster_details,
                             )
-                    last_snapshot_time = now
-                    snapshot_write_ms = (
-                        time.perf_counter() - snapshot_write_started
-                    ) * 1000
-                else:
-                    snapshot_write_ms = 0.0
+                            last_cluster_log_time = now
 
-                video_write_ms = 0.0
-                if debug_writer is not None and debug_frame is not None:
-                    video_write_started = time.perf_counter()
-                    try:
-                        debug_writer.write(debug_frame)
-                        debug_video_frame_count += 1
-                    except cv2.error:
-                        log.exception(
-                            "Failed to write debug video camera=%s "
-                            "path=%s frame=%s",
-                            self.camera.code,
-                            debug_video_path,
-                            _frame_description(debug_frame),
+                        has_candidates = (
+                            crowd_persistence.has_active_candidates()
                         )
-                        debug_writer.release()
-                        debug_writer = None
-                        debug_video_disabled = True
-                    video_write_ms = (
-                        time.perf_counter() - video_write_started
-                    ) * 1000
+                        if is_crowded and not was_crowded:
+                            log.info(
+                                "Crowd candidate detected camera=%s; waiting %.1fs persistence",
+                                self.camera.code,
+                                cf.CROWD_PERSISTENCE_SECONDS,
+                            )
+                            was_crowded = True
+                        elif was_crowded and not has_candidates:
+                            log.info("Crowd cleared camera=%s", self.camera.code)
+                            was_crowded = False
 
-                frame_completed_at = time.perf_counter()
-                frame_loop_ms = (
-                    frame_completed_at - frame_loop_started
-                ) * 1000
-                frame_stages = {
-                    "read": read_ms,
-                    "infer": inference_ms,
-                    "cluster": cluster_ms,
-                    "crowd": crowd_ms,
-                    "bbox_build": bbox_build_ms,
-                    "annotate": annotate_ms,
-                    "bbox_publish": bbox_publish_ms,
-                    "snapshot_write": snapshot_write_ms,
-                    "video_write": video_write_ms,
-                    "loop": frame_loop_ms,
-                }
-                for stage, duration_ms in frame_stages.items():
-                    stage_totals_ms[stage] += duration_ms
-                    stage_max_ms[stage] = max(
-                        stage_max_ms[stage],
-                        duration_ms,
-                    )
-                    stage_counts[stage] += 1
+                        snapshot_due = (
+                            cf.DEBUG_FRAME_SAVE_ENABLED
+                            and now - last_snapshot_time
+                            >= DEBUG_FRAME_SAVE_INTERVAL_S
+                        )
+                        needs_annotated_frame = (
+                            cf.DEBUG_VIDEO_ENABLED
+                            or snapshot_due
+                            or bool(ready_clusters)
+                        )
+                        annotate_ms = 0.0
+                        debug_frame = None
+                        if needs_annotated_frame:
+                            annotate_started = time.perf_counter()
+                            debug_frame = _annotate_bbox_detections(
+                                frame,
+                                dets,
+                                crowded_clusters,
+                                cf.CROWD_BBOX_PADDING_PERCENT,
+                                inference_ms,
+                                processing_fps,
+                            )
+                            debug_frame = _validate_debug_frame(
+                                debug_frame,
+                                "debug output",
+                            )
+                            annotate_ms = (
+                                time.perf_counter() - annotate_started
+                            ) * 1000
 
-                elapsed = time.monotonic() - last_performance_log_time
-                if elapsed >= PERFORMANCE_LOG_INTERVAL_S:
-                    stage_summary = " ".join(
-                        f"{stage}={stage_totals_ms[stage] / stage_counts[stage]:.0f}/"
-                        f"{stage_max_ms[stage]:.0f}ms"
-                        if stage_counts[stage]
-                        else f"{stage}=n/a"
-                        for stage in PERFORMANCE_STAGES
-                    )
-                    log.info(
-                        "Pipeline performance camera=%s frames=%d fps=%.2f "
-                        "cpu_threads=%d bbox_publish_ok=%d/%d "
-                        "stage_avg/max_ms=[%s]",
+                        snapshot_bytes = None
+                        snapshot_encode_ms = 0.0
+                        if snapshot_due or ready_clusters:
+                            snapshot_encode_started = time.perf_counter()
+                            try:
+                                if debug_frame is None:
+                                    raise RuntimeError(
+                                        "Annotated frame missing for snapshot"
+                                    )
+                                encoded, snapshot_buffer = cv2.imencode(
+                                    ".jpg",
+                                    debug_frame,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 90],
+                                )
+                                if encoded and snapshot_buffer.size:
+                                    snapshot_bytes = snapshot_buffer.tobytes()
+                                else:
+                                    log.error(
+                                        "Failed to encode snapshot camera=%s frame=%s",
+                                        self.camera.code,
+                                        _frame_description(debug_frame),
+                                    )
+                            except (cv2.error, RuntimeError):
+                                log.exception(
+                                    "Failed to encode snapshot camera=%s frame=%s",
+                                    self.camera.code,
+                                    _frame_description(debug_frame)
+                                    if debug_frame is not None
+                                    else "missing",
+                                )
+                            snapshot_encode_ms = (
+                                time.perf_counter() - snapshot_encode_started
+                            ) * 1000
+                            stage_totals_ms["snapshot_encode"] += (
+                                snapshot_encode_ms
+                            )
+                            stage_max_ms["snapshot_encode"] = max(
+                                stage_max_ms["snapshot_encode"],
+                                snapshot_encode_ms,
+                            )
+                            stage_counts["snapshot_encode"] += 1
+
+                        if ready_clusters:
+                            log.warning(
+                                "Persistent crowd detected camera=%s duration=%.1fs clusters=%s",
+                                self.camera.code,
+                                cf.CROWD_PERSISTENCE_SECONDS,
+                                [cluster for _, cluster, _ in ready_clusters],
+                            )
+                            event_track_ids = set().union(
+                                *(
+                                    track_ids
+                                    for _, _, track_ids in ready_clusters
+                                )
+                            )
+                            event_scheduled = _publish_crowd_event_async(
+                                self.client,
+                                self.camera.id,
+                                self.camera.code,
+                                [
+                                    {
+                                        "cluster_id": cluster_index + 1,
+                                        "person_count": len(cluster),
+                                        "detections": cluster,
+                                        "track_ids": sorted(
+                                            t for t in track_ids if t >= 0
+                                        ),
+                                    }
+                                    for cluster_index, cluster, track_ids in ready_clusters
+                                ],
+                                snapshot_jpg=snapshot_bytes,
+                                track_ids=event_track_ids,
+                                result_queue=publish_results,
+                            )
+                            if not event_scheduled:
+                                crowd_persistence.complete_publish(
+                                    event_track_ids,
+                                    False,
+                                    now,
+                                )
+                                log.error(
+                                    "Crowd event was not scheduled camera=%s; "
+                                    "will retry while crowd persists",
+                                    self.camera.code,
+                                )
+                            else:
+                                log.info(
+                                    "Crowd event publishing started camera=%s clusters=%d",
+                                    self.camera.code,
+                                    len(ready_clusters),
+                                )
+
+                        if snapshot_due:
+                            snapshot_write_started = time.perf_counter()
+                            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[
+                                :-3
+                            ]
+                            safe_camera_code = "".join(
+                                char if char.isalnum() or char in "-_" else "_"
+                                for char in self.camera.code
+                            )
+                            img_path = (
+                                image_save_dir / f"{safe_camera_code}_{ts}.jpg"
+                            )
+                            if snapshot_bytes is None:
+                                log.error(
+                                    "Skipping debug snapshot because JPEG encoding "
+                                    "failed camera=%s path=%s",
+                                    self.camera.code,
+                                    img_path,
+                                )
+                            else:
+                                try:
+                                    img_path.write_bytes(snapshot_bytes)
+                                    _prune_old_files(
+                                        image_save_dir,
+                                        "*.jpg",
+                                        cf.DEBUG_MAX_SAVED_FRAMES,
+                                    )
+                                except OSError:
+                                    log.exception(
+                                        "Failed to save debug snapshot camera=%s "
+                                        "path=%s frame=%s",
+                                        self.camera.code,
+                                        img_path,
+                                        _frame_description(debug_frame)
+                                        if debug_frame is not None
+                                        else "missing",
+                                    )
+                            last_snapshot_time = now
+                            snapshot_write_ms = (
+                                time.perf_counter() - snapshot_write_started
+                            ) * 1000
+                        else:
+                            snapshot_write_ms = 0.0
+
+                        video_write_ms = 0.0
+                        if debug_writer is not None and debug_frame is not None:
+                            video_write_started = time.perf_counter()
+                            try:
+                                debug_writer.write(debug_frame)
+                                debug_video_frame_count += 1
+                            except cv2.error:
+                                log.exception(
+                                    "Failed to write debug video camera=%s "
+                                    "path=%s frame=%s",
+                                    self.camera.code,
+                                    debug_video_path,
+                                    _frame_description(debug_frame),
+                                )
+                                debug_writer.release()
+                                debug_writer = None
+                                debug_video_disabled = True
+                            video_write_ms = (
+                                time.perf_counter() - video_write_started
+                            ) * 1000
+
+                        frame_completed_at = time.perf_counter()
+                        frame_loop_ms = (
+                            frame_completed_at - frame_loop_started
+                        ) * 1000
+                        frame_stages = {
+                            "read": read_ms,
+                            "infer": inference_ms,
+                            "cluster": cluster_ms,
+                            "crowd": crowd_ms,
+                            "bbox_build": bbox_build_ms,
+                            "annotate": annotate_ms,
+                            "bbox_publish": bbox_publish_ms,
+                            "snapshot_write": snapshot_write_ms,
+                            "video_write": video_write_ms,
+                            "loop": frame_loop_ms,
+                        }
+                        for stage, duration_ms in frame_stages.items():
+                            stage_totals_ms[stage] += duration_ms
+                            stage_max_ms[stage] = max(
+                                stage_max_ms[stage],
+                                duration_ms,
+                            )
+                            stage_counts[stage] += 1
+
+                        elapsed = time.monotonic() - last_performance_log_time
+                        if elapsed >= PERFORMANCE_LOG_INTERVAL_S:
+                            stage_summary = " ".join(
+                                f"{stage}={stage_totals_ms[stage] / stage_counts[stage]:.0f}/"
+                                f"{stage_max_ms[stage]:.0f}ms"
+                                if stage_counts[stage]
+                                else f"{stage}=n/a"
+                                for stage in PERFORMANCE_STAGES
+                            )
+                            log.info(
+                                "Pipeline performance camera=%s frames=%d fps=%.2f "
+                                "cpu_threads=%d bbox_publish_ok=%d/%d "
+                                "stage_avg/max_ms=[%s]",
+                                self.camera.code,
+                                frame_count,
+                                frame_count / elapsed,
+                                torch.get_num_threads(),
+                                bbox_publish_success_count,
+                                bbox_publish_count,
+                                stage_summary,
+                            )
+                            frame_count = 0
+                            bbox_publish_count = 0
+                            bbox_publish_success_count = 0
+                            for stage in PERFORMANCE_STAGES:
+                                stage_totals_ms[stage] = 0.0
+                                stage_max_ms[stage] = 0.0
+                                stage_counts[stage] = 0
+                            last_performance_log_time = time.monotonic()
+                except Exception:
+                    log.exception(
+                        "Worker frame error for camera=%s; continuing...",
                         self.camera.code,
-                        frame_count,
-                        frame_count / elapsed,
-                        torch.get_num_threads(),
-                        bbox_publish_success_count,
-                        bbox_publish_count,
-                        stage_summary,
                     )
-                    frame_count = 0
-                    bbox_publish_count = 0
-                    bbox_publish_success_count = 0
-                    for stage in PERFORMANCE_STAGES:
-                        stage_totals_ms[stage] = 0.0
-                        stage_max_ms[stage] = 0.0
-                        stage_counts[stage] = 0
-                    last_performance_log_time = time.monotonic()
+                    self._stop_event.wait(1.0)
 
         except Exception:
             log.exception("Worker loop failed for camera=%s", self.camera.code)
         finally:
-            grabber.stop()
+            if grabber is not None:
+                grabber.stop()
 
         if debug_writer is not None:
             debug_writer.release()

@@ -44,7 +44,7 @@ YOLO_IMGSZ = 896
 YOLO_HALF_PRECISION = True
 YOLO_MODEL_CONF = 0.55
 YOLO_CPU_THREADS = 6
-MAX_CONCURRENT_INFERENCES = 2
+MAX_CONCURRENT_INFERENCES = 1
 
 # ==============================================================================
 # 3. CẤU HÌNH ĐÁNH GIÁ KHOẢNG CÁCH & ĐÁM ĐÔNG (Chỉnh sửa trực tiếp tại đây)

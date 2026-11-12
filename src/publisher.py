@@ -14,28 +14,39 @@ import src.config as cf
 log = logging.getLogger("publisher")
 TZ = timezone(timedelta(hours=7))
 _MQTT_PUBLISH_LOCK = threading.Lock()
+_S3_CLIENT_LOCK = threading.Lock()
+_s3_client = None
 
-_s3_client = boto3.client(
-    "s3",
-    endpoint_url=cf.VMS_S3_ENDPOINT,
-    aws_access_key_id=cf.VMS_S3_ACCESS_KEY,
-    aws_secret_access_key=cf.VMS_S3_SECRET_KEY,
-    region_name="us-east-1",
-    config=Config(
-        signature_version="s3v4",
-        s3={"addressing_style": "path"},
-        connect_timeout=5,
-        read_timeout=15,
-        retries={"max_attempts": 3, "mode": "standard"},
-    ),
-)
+
+def _get_s3_client():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    with _S3_CLIENT_LOCK:
+        if _s3_client is None:
+            _s3_client = boto3.client(
+                "s3",
+                endpoint_url=cf.VMS_S3_ENDPOINT,
+                aws_access_key_id=cf.VMS_S3_ACCESS_KEY,
+                aws_secret_access_key=cf.VMS_S3_SECRET_KEY,
+                region_name="us-east-1",
+                config=Config(
+                    signature_version="s3v4",
+                    s3={"addressing_style": "path"},
+                    connect_timeout=5,
+                    read_timeout=15,
+                    retries={"max_attempts": 3, "mode": "standard"},
+                ),
+            )
+        return _s3_client
 
 
 def upload_snapshot(jpg: bytes, camera_id: str, category: str = "crowd") -> str | None:
     try:
+        s3_client = _get_s3_client()
         day = datetime.now(TZ).strftime("%Y-%m-%d")
         key = f"{category}/{day}/camera_{camera_id}/{uuid.uuid4().hex}.jpg"
-        _s3_client.put_object(
+        s3_client.put_object(
             Bucket=cf.VMS_S3_BUCKET,
             Key=key,
             Body=jpg,

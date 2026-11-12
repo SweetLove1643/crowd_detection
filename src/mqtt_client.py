@@ -106,7 +106,6 @@ def build_client() -> mqtt.Client:
         log.info("Connected: %s", reason_code)
         if reason_code != 0:
             log.error("Failed connect: (%s)", reason_code)
-            client.disconnect()
             return
 
         rc, mid = client.subscribe(TOPIC_CAMERAS, qos=1)

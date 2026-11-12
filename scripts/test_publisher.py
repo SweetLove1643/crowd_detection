@@ -105,12 +105,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Test publish crowd event to VMS")
     parser.add_argument(
         "--camera-id",
-        default="test-cam-" + uuid.uuid4().hex[:6],
+        default="e53b2945-fae2-448c-ad78-ab45ecbe68ad",
         help="Camera ID test (UUID hoặc mã)",
     )
     parser.add_argument(
         "--camera-code",
-        default="CAM_TEST_CROWD",
+        default="loi-vao-nha-tron",
         help="Camera Code hiển thị trên VMS",
     )
     parser.add_argument(
@@ -187,6 +187,7 @@ def main() -> None:
         "severity": severity,
         "payload": {
             "type": "HIGH_DENSITY",
+            "zone_id": str(cf.ZONE_ID),
             "person_count": args.people,
             "threshold": int(cf.NUMBER_PERSON_IS_CROWDED),
             "clusters": dummy_clusters,
