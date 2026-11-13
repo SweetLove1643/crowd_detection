@@ -615,7 +615,6 @@ def _build_bbox_detections(
     publish_all_person_bbox: bool,
     padding_percent: float,
 ) -> list[dict[str, object]]:
-    is_crowded = bool(crowded_clusters)
     detection_clusters = {
         detection_index: cluster_index + 1
         for cluster_index, cluster in enumerate(clusters)
@@ -629,8 +628,10 @@ def _build_bbox_detections(
     bbox_detections: list[dict[str, object]] = []
 
     for detection_index, detection in enumerate(detections):
-        is_crowd_member = detection_index in crowd_detection_indices
-        if not is_crowd_member and (is_crowded or not publish_all_person_bbox):
+        if (
+            detection_index in crowd_detection_indices
+            or not publish_all_person_bbox
+        ):
             continue
 
         x1, y1, x2, y2, confidence, track_id = detection
@@ -651,7 +652,7 @@ def _build_bbox_detections(
                 round(x2 / frame_width, 6),
                 round(y2 / frame_height, 6),
             ],
-            "color": CROWD_COLOR_HEX if is_crowd_member else PERSON_COLOR_HEX,
+            "color": PERSON_COLOR_HEX,
             "cluster_id": detection_clusters[detection_index],
         }
         if track_id is not None:
@@ -705,11 +706,11 @@ def _annotate_bbox_detections(
     processing_fps: float,
 ) -> np.ndarray:
     annotated = frame.copy()
-    crowd_indices = {
-        detection_index
-        for _, cluster in crowded_clusters
-        for detection_index in cluster
-    }
+    # crowd_indices = {
+    #     detection_index
+    #     for _, cluster in crowded_clusters
+    #     for detection_index in cluster
+    # }
 
     def draw_box(
         box: tuple[float, float, float, float],
@@ -729,25 +730,25 @@ def _annotate_bbox_detections(
             cv2.LINE_AA,
         )
 
-    for detection_index, (
-        x1,
-        y1,
-        x2,
-        y2,
-        confidence,
-        track_id,
-    ) in enumerate(detections):
-        is_crowd_member = detection_index in crowd_indices
-        draw_box(
-            (x1, y1, x2, y2),
-            CROWD_COLOR_BGR if is_crowd_member else PERSON_COLOR_BGR,
-            (
-                f"Người_{track_id}"
-                if track_id is not None
-                else f"Người_{detection_index}"
-            )
-            + f" {confidence:.2f}",
-        )
+    # for detection_index, (
+    #     x1,
+    #     y1,
+    #     x2,
+    #     y2,
+    #     confidence,
+    #     track_id,
+    # ) in enumerate(detections):
+    #     is_crowd_member = detection_index in crowd_indices
+    #     draw_box(
+    #         (x1, y1, x2, y2),
+    #         CROWD_COLOR_BGR if is_crowd_member else PERSON_COLOR_BGR,
+    #         (
+    #             f"Người_{track_id}"
+    #             if track_id is not None
+    #             else f"Người_{detection_index}"
+    #         )
+    #         + f" {confidence:.2f}",
+    #     )
 
     for cluster_index, cluster in crowded_clusters:
         cluster_boxes = [detections[index] for index in cluster]
@@ -768,16 +769,16 @@ def _annotate_bbox_detections(
             f"Cụm {cluster_index + 1} ({len(cluster)} người)",
         )
 
-    cv2.putText(
-        annotated,
-        f"Inference: {inference_ms:.1f} ms | Processing: {processing_fps:.1f} FPS",
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
+    # cv2.putText(
+    #     annotated,
+    #     f"Inference: {inference_ms:.1f} ms | Processing: {processing_fps:.1f} FPS",
+    #     (12, 28),
+    #     cv2.FONT_HERSHEY_SIMPLEX,
+    #     0.7,
+    #     (255, 255, 255),
+    #     2,
+    #     cv2.LINE_AA,
+    # )
     return annotated
 
 
