@@ -36,13 +36,13 @@ VMS_S3_SECRET_KEY = os.getenv("VMS_S3_SECRET_KEY", "").strip()
 # ==============================================================================
 # 2. CẤU HÌNH MODEL AI & INFERENCE (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
-WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/final.pt"
+WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/best.pt"
 OPENVINO_MODEL_PATH = "./resources/runs/train/weights/final_openvino_model"
 YOLO_INFERENCE_BACKEND = "auto"  # "auto" | "pytorch" | "cuda" | "openvino" | "tensorrt"
 YOLO_OPENVINO_DEVICE = "intel:cpu"
 YOLO_IMGSZ = 960
 YOLO_HALF_PRECISION = True
-YOLO_MODEL_CONF = 0.4
+YOLO_MODEL_CONF = 0.6
 YOLO_MODEL_IOU = 0.7
 YOLO_CPU_THREADS = 6
 MAX_CONCURRENT_INFERENCES = 1
@@ -50,7 +50,7 @@ MAX_CONCURRENT_INFERENCES = 1
 # ==============================================================================
 # 3. CẤU HÌNH ĐÁNH GIÁ KHOẢNG CÁCH & ĐÁM ĐÔNG (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
-PROXIMITY_ALPHA = 1.7
+PROXIMITY_ALPHA = 2.0
 PROXIMITY_Y_SCALE = 1.9
 PROXIMITY_LENGTH_MODE = "max"  # "max" | "height"
 

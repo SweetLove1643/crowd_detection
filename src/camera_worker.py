@@ -675,7 +675,8 @@ def _build_bbox_detections(
         bbox_detections.append(
             {
                 "id": f"crowd_{cluster_index + 1}",
-                "label": f"Cụm {cluster_index + 1} ({len(cluster)} người)",
+                "label": f"{len(cluster)} người",
+                # "label": f"Cụm {cluster_index + 1} ({len(cluster)} người)",
                 "class": "crowd",
                 "bbox": [
                     round(x1 / frame_width, 6),
@@ -766,7 +767,8 @@ def _annotate_bbox_detections(
                 min(frame.shape[0], y2 + pad_y),
             ),
             CROWD_COLOR_BGR,
-            f"Cụm {cluster_index + 1} ({len(cluster)} người)",
+            f"{len(cluster)} người",
+            # f"Cụm {cluster_index + 1} ({len(cluster)} người)",
         )
 
     # cv2.putText(
