@@ -8,6 +8,9 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from ultralytics.cfg import DEFAULT_CFG_DICT
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.utils import IterableSimpleNamespace, YAML
+from ultralytics.utils.checks import check_yaml
 import yaml
 
 from src import config as cf
@@ -20,6 +23,16 @@ _INFERENCE_SEMAPHORE = threading.Semaphore(cf.MAX_CONCURRENT_INFERENCES)
 _SHARED_MODEL_LOCK = threading.Lock()
 _MODEL_INFERENCE_LOCK = threading.Lock()
 _SHARED_MODELS: dict[tuple[str, str, str, int, bool], tuple[YOLO, dict | list]] = {}
+_BYTETRACK_CFG: dict[str, Any] | None = None
+
+
+def _get_bytetrack_cfg() -> dict[str, Any]:
+    global _BYTETRACK_CFG
+    if _BYTETRACK_CFG is None:
+        with _SHARED_MODEL_LOCK:
+            if _BYTETRACK_CFG is None:
+                _BYTETRACK_CFG = dict(YAML.load(check_yaml("bytetrack.yaml")))
+    return dict(_BYTETRACK_CFG)
 
 
 def _resolve_openvino_dir(weights_path: Path) -> Path | None:
@@ -96,7 +109,9 @@ class PersonDetector:
 
         weights_path = Path(resolved_weights)
         self._confidence = resolved_conf
-        self._camera_trackers: list[Any] | None = None
+        self._tracker = BYTETracker(
+            IterableSimpleNamespace(**_get_bytetrack_cfg())
+        )
         self._backend, self._device, model_target, self._imgsz, self._half = (
             self._select_runtime(weights_path)
         )
@@ -281,47 +296,47 @@ class PersonDetector:
                 if newer_frame is not None:
                     frame = newer_frame
 
-            predictor = getattr(self._model, "predictor", None)
-            if predictor is not None:
-                if self._camera_trackers is not None:
-                    predictor.trackers = self._camera_trackers
-                elif hasattr(predictor, "trackers"):
-                    delattr(predictor, "trackers")
-
-            result = self._model.track(
+            result = self._model.predict(
                 frame,
-                persist=True,
-                tracker="bytetrack.yaml",
                 imgsz=self._imgsz,
-                iou=cf.YOLO_MODEL_IOU,
                 conf=self._confidence,
+                iou=cf.YOLO_MODEL_IOU,
                 classes=list(self.person_class_ids),
                 device=self._device,
                 verbose=False,
                 **infer_kwargs,
             )[0]
 
-            predictor = getattr(self._model, "predictor", None)
-            if predictor is not None and hasattr(predictor, "trackers"):
-                self._camera_trackers = list(predictor.trackers)
-
             self._restore_torch_runtime()
 
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
+            if boxes is not None:
+                self._tracker.update(boxes.cpu().numpy(), frame)
             return []
 
-        xyxy = boxes.xyxy.cpu().numpy()
-        conf = boxes.conf.cpu().numpy()
-        track_ids = (
-            boxes.id.int().cpu().tolist()
-            if boxes.id is not None
-            else [None] * len(boxes)
-        )
+        det_boxes = boxes.cpu().numpy()
+        tracks = self._tracker.update(det_boxes, frame)
+        if len(tracks) == 0:
+            if any(not t.is_activated for t in self._tracker.tracked_stracks):
+                return []
+            xyxy = det_boxes.xyxy
+            conf = det_boxes.conf
+            return [
+                (float(x1), float(y1), float(x2), float(y2), float(score), None)
+                for (x1, y1, x2, y2), score in zip(xyxy, conf)
+            ]
 
         return [
-            (float(x1), float(y1), float(x2), float(y2), float(score), track_id)
-            for (x1, y1, x2, y2), score, track_id in zip(xyxy, conf, track_ids)
+            (
+                float(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[5]),
+                int(row[4]),
+            )
+            for row in tracks
         ]
 
     def visualize(

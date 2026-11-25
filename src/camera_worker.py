@@ -1,6 +1,7 @@
 # Bước 3: 1 camera = 1 tiến trình FFmpeg đọc RTSP + 1 thread xử lý AI
 import json
 import logging
+import math
 import queue
 import subprocess
 import threading
@@ -35,9 +36,9 @@ PERFORMANCE_STAGES = (
     "read",
     "infer",
     "cluster",
+    "crowd",
     "bbox_build",
     "bbox_publish",
-    "crowd",
     "annotate",
     "snapshot_encode",
     "snapshot_write",
@@ -91,7 +92,7 @@ def _bbox_center_distance_ratio(
     acy = (box_a[1] + box_a[3]) * 0.5
     bcx = (box_b[0] + box_b[2]) * 0.5
     bcy = (box_b[1] + box_b[3]) * 0.5
-    dist = float(np.hypot(acx - bcx, acy - bcy))
+    dist = math.hypot(acx - bcx, acy - bcy)
     size_a = max(box_a[2] - box_a[0], box_a[3] - box_a[1], 1.0)
     size_b = max(box_b[2] - box_b[0], box_b[3] - box_b[1], 1.0)
     ref_size = (size_a + size_b) * 0.5
@@ -116,13 +117,44 @@ def _prune_old_files(directory: Path, pattern: str, max_files: int) -> None:
         pass
 
 
+def _smooth_bbox(
+    prev_box: BBoxCoords | None,
+    new_box: BBoxCoords,
+    alpha: float,
+) -> BBoxCoords:
+    if prev_box is None or alpha >= 1.0:
+        return new_box
+    inv = 1.0 - alpha
+    return (
+        prev_box[0] * inv + new_box[0] * alpha,
+        prev_box[1] * inv + new_box[1] * alpha,
+        prev_box[2] * inv + new_box[2] * alpha,
+        prev_box[3] * inv + new_box[3] * alpha,
+    )
+
+
+@dataclass(frozen=True)
+class DisplayCrowd:
+    crowd_id: int
+    bbox: BBoxCoords
+    person_count: int
+    member_indices: tuple[int, ...]
+    track_ids: tuple[int, ...]
+    holding: bool
+
+
 @dataclass
 class _CrowdCandidate:
+    crowd_id: int
     track_ids: set[int]
     started_at: float
     last_seen: float
+    last_crowded_at: float
+    person_count: int
     bbox: BBoxCoords | None = None
+    smoothed_bbox: BBoxCoords | None = None
     history_track_ids: set[int] = field(default_factory=set)
+    member_indices: list[int] = field(default_factory=list)
     notified: bool = False
     publishing: bool = False
     last_publish_attempt: float = 0.0
@@ -131,6 +163,8 @@ class _CrowdCandidate:
     def __post_init__(self) -> None:
         if not self.history_track_ids and self.track_ids:
             self.history_track_ids = set(self.track_ids)
+        if self.smoothed_bbox is None and self.bbox is not None:
+            self.smoothed_bbox = self.bbox
 
 
 class CrowdPersistence:
@@ -138,25 +172,60 @@ class CrowdPersistence:
         self,
         duration_s: float,
         grace_s: float = CROWD_TRACK_GRACE_S,
+        hold_s: float | None = None,
+        smoothing_alpha: float | None = None,
     ) -> None:
-        self.duration_s = duration_s
-        self.grace_s = grace_s
+        self.duration_s = float(duration_s)
+        self.grace_s = float(grace_s)
+        self.hold_s = (
+            float(cf.CROWD_BBOX_HOLD_SECONDS)
+            if hold_s is None
+            else float(hold_s)
+        )
+        self.smoothing_alpha = (
+            float(cf.CROWD_BBOX_SMOOTHING_ALPHA)
+            if smoothing_alpha is None
+            else float(smoothing_alpha)
+        )
         self._candidates: list[_CrowdCandidate] = []
+        self._next_crowd_id: int = 1
+
+    @staticmethod
+    def _real_ids(ids: set[int]) -> set[int]:
+        return {t for t in ids if t >= 0}
 
     def update(
         self,
+        clusters: list[Cluster],
         crowded_clusters: list[CrowdedCluster],
         detections: list[Detection],
         now: float,
         frame_interval_s: float = 0.0,
-    ) -> list[tuple[int, Cluster, set[int]]]:
-        effective_grace_s = max(self.grace_s, frame_interval_s * 2.5)
+    ) -> tuple[list[DisplayCrowd], list[tuple[int, Cluster, set[int]]]]:
+        effective_hold_s = (
+            max(self.hold_s, frame_interval_s * 2.5)
+            if self.hold_s > 0.0
+            else 0.0
+        )
+        effective_event_grace_s = max(
+            self.grace_s,
+            effective_hold_s,
+            frame_interval_s * 2.5,
+        )
+
         self._candidates = [
             candidate
             for candidate in self._candidates
-            if now - candidate.last_seen <= effective_grace_s
+            if now - candidate.last_crowded_at <= effective_event_grace_s
         ]
-        available = set(range(len(self._candidates)))
+
+        for candidate in self._candidates:
+            candidate.member_indices = []
+
+        matched_crowd_ids: set[int] = set()
+        claimed_cluster_indices: set[int] = {
+            cluster_index for cluster_index, _ in crowded_clusters
+        }
         ready: list[tuple[int, list[int], set[int]]] = []
 
         for cluster_index, cluster in crowded_clusters:
@@ -170,15 +239,19 @@ class CrowdPersistence:
                 for pos in range(len(cluster))
             }
             effective_ids = tracked_ids if tracked_ids else synthetic_ids
+            real_effective_ids = self._real_ids(effective_ids)
             cluster_box = _cluster_bbox(cluster, detections)
 
             match_index = None
             best_score = -1.0
 
-            for index in sorted(available):
-                cand = self._candidates[index]
-                overlap = len(cand.track_ids & effective_ids)
-                hist_overlap = len(cand.history_track_ids & effective_ids)
+            for index, cand in enumerate(self._candidates):
+                if cand.crowd_id in matched_crowd_ids:
+                    continue
+                overlap = len(self._real_ids(cand.track_ids) & real_effective_ids)
+                hist_overlap = len(
+                    self._real_ids(cand.history_track_ids) & real_effective_ids
+                )
 
                 iou = (
                     _bbox_iou(cand.bbox, cluster_box)
@@ -208,23 +281,39 @@ class CrowdPersistence:
 
             if match_index is not None:
                 candidate = self._candidates[match_index]
-                available.discard(match_index)
+                matched_crowd_ids.add(candidate.crowd_id)
                 candidate.track_ids = set(effective_ids)
                 candidate.history_track_ids |= effective_ids
                 if len(candidate.history_track_ids) > 64:
                     candidate.history_track_ids = set(effective_ids)
+                candidate.person_count = len(cluster)
+                candidate.member_indices = list(cluster)
+                candidate.last_seen = now
+                candidate.last_crowded_at = now
                 if cluster_box is not None:
                     candidate.bbox = cluster_box
-                candidate.last_seen = now
+                    candidate.smoothed_bbox = _smooth_bbox(
+                        candidate.smoothed_bbox,
+                        cluster_box,
+                        self.smoothing_alpha,
+                    )
             else:
+                crowd_id = self._next_crowd_id
+                self._next_crowd_id += 1
                 candidate = _CrowdCandidate(
+                    crowd_id=crowd_id,
                     track_ids=set(effective_ids),
                     started_at=now,
                     last_seen=now,
+                    last_crowded_at=now,
+                    person_count=len(cluster),
                     bbox=cluster_box,
+                    smoothed_bbox=cluster_box,
                     history_track_ids=set(effective_ids),
+                    member_indices=list(cluster),
                 )
                 self._candidates.append(candidate)
+                matched_crowd_ids.add(crowd_id)
 
             persistence_met = now - candidate.started_at >= self.duration_s
             retry_due = (
@@ -254,9 +343,144 @@ class CrowdPersistence:
             ):
                 candidate.publishing = True
                 candidate.last_publish_attempt = now
-                ready.append((cluster_index, cluster, set(effective_ids)))
+                ready.append((candidate.crowd_id, cluster, set(effective_ids)))
 
-        return ready
+        matched_candidates = [
+            c
+            for c in self._candidates
+            if c.crowd_id in matched_crowd_ids
+        ]
+        absorbed_ids: set[int] = set()
+
+        for candidate in self._candidates:
+            if candidate.crowd_id in matched_crowd_ids:
+                continue
+
+            cand_real = self._real_ids(candidate.track_ids)
+            for other in matched_candidates:
+                other_real = self._real_ids(other.track_ids)
+                id_merged = bool(cand_real) and (
+                    len(cand_real & other_real) >= max(2, len(cand_real) // 2)
+                )
+                box_merged = (
+                    candidate.bbox is not None
+                    and other.bbox is not None
+                    and _bbox_iou(candidate.bbox, other.bbox) >= 0.35
+                )
+                if id_merged or box_merged:
+                    other.history_track_ids |= candidate.history_track_ids
+                    if len(other.history_track_ids) > 64:
+                        other.history_track_ids = set(other.track_ids)
+                    other.started_at = min(other.started_at, candidate.started_at)
+                    absorbed_ids.add(candidate.crowd_id)
+                    break
+
+            if candidate.crowd_id in absorbed_ids:
+                continue
+
+            if now - candidate.last_crowded_at <= effective_hold_s:
+                best_cluster_index = None
+                best_cluster: Cluster | None = None
+                best_sub_box: BBoxCoords | None = None
+                best_sub_ids: set[int] = set()
+                best_score = -1.0
+
+                for cluster_index, cluster in enumerate(clusters):
+                    if (
+                        cluster_index in claimed_cluster_indices
+                        or len(cluster) < 2
+                    ):
+                        continue
+                    sub_ids = {
+                        int(detections[index][5])
+                        for index in cluster
+                        if detections[index][5] is not None
+                    }
+                    sub_box = _cluster_bbox(cluster, detections)
+                    overlap = len(cand_real & sub_ids)
+                    hist_overlap = len(
+                        self._real_ids(candidate.history_track_ids) & sub_ids
+                    )
+                    iou = (
+                        _bbox_iou(candidate.bbox, sub_box)
+                        if candidate.bbox is not None and sub_box is not None
+                        else 0.0
+                    )
+                    center_ratio = (
+                        _bbox_center_distance_ratio(candidate.bbox, sub_box)
+                        if candidate.bbox is not None and sub_box is not None
+                        else float("inf")
+                    )
+                    spatial_match = (
+                        iou >= cf.CROWD_SPATIAL_IOU_THRESHOLD
+                        or center_ratio <= cf.CROWD_CENTER_DISTANCE_RATIO
+                    )
+                    if overlap > 0 or hist_overlap > 0 or spatial_match:
+                        score = (
+                            overlap * 10.0
+                            + hist_overlap * 3.0
+                            + iou * 5.0
+                            + max(0.0, 1.0 - center_ratio)
+                        )
+                        if score > best_score:
+                            best_score = score
+                            best_cluster_index = cluster_index
+                            best_cluster = cluster
+                            best_sub_box = sub_box
+                            best_sub_ids = sub_ids
+
+                if best_cluster_index is not None and best_cluster is not None:
+                    claimed_cluster_indices.add(best_cluster_index)
+                    candidate.member_indices = list(best_cluster)
+                    candidate.last_seen = now
+                    if best_sub_ids:
+                        candidate.history_track_ids |= best_sub_ids
+                        if len(candidate.history_track_ids) > 64:
+                            candidate.history_track_ids = set(best_sub_ids)
+                    if best_sub_box is not None:
+                        candidate.bbox = best_sub_box
+                        candidate.smoothed_bbox = _smooth_bbox(
+                            candidate.smoothed_bbox,
+                            best_sub_box,
+                            self.smoothing_alpha,
+                        )
+
+        if absorbed_ids:
+            self._candidates = [
+                candidate
+                for candidate in self._candidates
+                if candidate.crowd_id not in absorbed_ids
+            ]
+
+        display_crowds: list[DisplayCrowd] = []
+        for candidate in self._candidates:
+            if now - candidate.last_crowded_at > effective_hold_s:
+                continue
+            box = candidate.smoothed_bbox or candidate.bbox
+            if box is None:
+                continue
+            is_holding = candidate.crowd_id not in matched_crowd_ids
+            if candidate.member_indices:
+                visible_track_ids = {
+                    int(detections[index][5])
+                    for index in candidate.member_indices
+                    if 0 <= index < len(detections)
+                    and detections[index][5] is not None
+                }
+            else:
+                visible_track_ids = self._real_ids(candidate.track_ids)
+            display_crowds.append(
+                DisplayCrowd(
+                    crowd_id=candidate.crowd_id,
+                    bbox=box,
+                    person_count=candidate.person_count,
+                    member_indices=tuple(candidate.member_indices),
+                    track_ids=tuple(sorted(visible_track_ids)),
+                    holding=is_holding,
+                )
+            )
+
+        return display_crowds, ready
 
     def complete_publish(
         self,
@@ -324,6 +548,7 @@ class FFmpegFrameGrabber:
         *,
         width: int | None = None,
         height: int | None = None,
+        max_width: int | None = None,
         startup_timeout: float = 10.0,
         stall_timeout: float = 3.5,
         max_frame_age: float = 0.40,
@@ -334,9 +559,16 @@ class FFmpegFrameGrabber:
             height is not None and height <= 0
         ):
             raise ValueError("Kích thước frame phải dương")
+        resolved_max_width = (
+            int(cf.FFMPEG_MAX_WIDTH) if max_width is None else int(max_width)
+        )
+        if resolved_max_width < 0:
+            raise ValueError("max_width không được âm")
         self.camera = camera
         self.width = width
         self.height = height
+        self._max_width = resolved_max_width
+        self._needs_scale: bool = bool(width and height)
         self._stop_event = stop_event
         self._closed = threading.Event()
         self._cond = threading.Condition()
@@ -476,6 +708,11 @@ class FFmpegFrameGrabber:
 
     def _command(self) -> list[str]:
         decoder = ["-c:v", self._decoder] if self._decoder else []
+        scale_filter = (
+            ["-vf", f"scale={self.width}:{self.height}:flags=fast_bilinear"]
+            if self._needs_scale
+            else []
+        )
         return [
             "ffmpeg",
             "-nostdin",
@@ -496,8 +733,7 @@ class FFmpegFrameGrabber:
             "-an",
             "-sn",
             "-dn",
-            "-vf",
-            f"scale={self.width}:{self.height}:flags=fast_bilinear",
+            *scale_filter,
             "-vsync",
             "0",
             "-c:v",
@@ -526,15 +762,27 @@ class FFmpegFrameGrabber:
             return True
         try:
             stream = probe_stream(self.camera)
-            width = int(stream["width"])
-            height = int(stream["height"])
-            if width <= 0 or height <= 0:
-                raise ValueError(f"Invalid stream size {width}x{height}")
-            self.width = width
-            self.height = height
+            src_w = int(stream["width"])
+            src_h = int(stream["height"])
+            if src_w <= 0 or src_h <= 0:
+                raise ValueError(f"Invalid stream size {src_w}x{src_h}")
+            if self._max_width > 0 and src_w > self._max_width:
+                target_w = max(2, (self._max_width // 2) * 2)
+                target_h = max(
+                    2, (int(round(src_h * (target_w / src_w))) // 2) * 2
+                )
+                self.width = target_w
+                self.height = target_h
+                self._needs_scale = True
+            else:
+                self.width = src_w
+                self.height = src_h
+                self._needs_scale = False
             log.info(
-                "Opened RTSP stream info camera=%s size=%dx%d codec=%s fps=%s",
+                "Opened RTSP stream info camera=%s src=%dx%d out=%dx%d codec=%s fps=%s",
                 self.camera.code,
+                src_w,
+                src_h,
                 self.width,
                 self.height,
                 stream.get("codec_name"),
@@ -609,7 +857,7 @@ class FFmpegFrameGrabber:
 def _build_bbox_detections(
     detections: list[Detection],
     clusters: list[Cluster],
-    crowded_clusters: list[CrowdedCluster],
+    display_crowds: list[DisplayCrowd],
     frame_width: int,
     frame_height: int,
     publish_all_person_bbox: bool,
@@ -622,8 +870,8 @@ def _build_bbox_detections(
     }
     crowd_detection_indices = {
         detection_index
-        for _, cluster in crowded_clusters
-        for detection_index in cluster
+        for crowd in display_crowds
+        for detection_index in crowd.member_indices
     }
     bbox_detections: list[dict[str, object]] = []
 
@@ -659,13 +907,9 @@ def _build_bbox_detections(
             person_bbox["track_id"] = track_id
         bbox_detections.append(person_bbox)
 
-    for cluster_index, cluster in crowded_clusters:
-        cluster_boxes = [detections[index] for index in cluster]
-        padding = padding_percent / 100
-        x1 = min(box[0] for box in cluster_boxes)
-        y1 = min(box[1] for box in cluster_boxes)
-        x2 = max(box[2] for box in cluster_boxes)
-        y2 = max(box[3] for box in cluster_boxes)
+    padding = padding_percent / 100
+    for crowd in display_crowds:
+        x1, y1, x2, y2 = crowd.bbox
         pad_x = (x2 - x1) * padding
         pad_y = (y2 - y1) * padding
         x1 = max(0, x1 - pad_x)
@@ -674,9 +918,9 @@ def _build_bbox_detections(
         y2 = min(frame_height, y2 + pad_y)
         bbox_detections.append(
             {
-                "id": f"crowd_{cluster_index + 1}",
-                "label": f"{len(cluster)} người",
-                # "label": f"Cụm {cluster_index + 1} ({len(cluster)} người)",
+                "id": f"crowd_{crowd.crowd_id}",
+                "label": f"{crowd.person_count} người",
+                # "label": f"Cụm {crowd.crowd_id} ({crowd.person_count} người)",
                 "class": "crowd",
                 "bbox": [
                     round(x1 / frame_width, 6),
@@ -685,13 +929,9 @@ def _build_bbox_detections(
                     round(y2 / frame_height, 6),
                 ],
                 "color": CROWD_COLOR_HEX,
-                "cluster_id": cluster_index + 1,
-                "person_count": len(cluster),
-                "track_ids": sorted(
-                    detections[index][5]
-                    for index in cluster
-                    if detections[index][5] is not None
-                ),
+                "cluster_id": crowd.crowd_id,
+                "person_count": crowd.person_count,
+                "track_ids": list(crowd.track_ids),
             }
         )
 
@@ -701,17 +941,12 @@ def _build_bbox_detections(
 def _annotate_bbox_detections(
     frame: np.ndarray,
     detections: list[Detection],
-    crowded_clusters: list[CrowdedCluster],
+    display_crowds: list[DisplayCrowd],
     padding_percent: float,
     inference_ms: float,
     processing_fps: float,
 ) -> np.ndarray:
     annotated = frame.copy()
-    # crowd_indices = {
-    #     detection_index
-    #     for _, cluster in crowded_clusters
-    #     for detection_index in cluster
-    # }
 
     def draw_box(
         box: tuple[float, float, float, float],
@@ -731,34 +966,11 @@ def _annotate_bbox_detections(
             cv2.LINE_AA,
         )
 
-    # for detection_index, (
-    #     x1,
-    #     y1,
-    #     x2,
-    #     y2,
-    #     confidence,
-    #     track_id,
-    # ) in enumerate(detections):
-    #     is_crowd_member = detection_index in crowd_indices
-    #     draw_box(
-    #         (x1, y1, x2, y2),
-    #         CROWD_COLOR_BGR if is_crowd_member else PERSON_COLOR_BGR,
-    #         (
-    #             f"Người_{track_id}"
-    #             if track_id is not None
-    #             else f"Người_{detection_index}"
-    #         )
-    #         + f" {confidence:.2f}",
-    #     )
-
-    for cluster_index, cluster in crowded_clusters:
-        cluster_boxes = [detections[index] for index in cluster]
-        x1 = min(box[0] for box in cluster_boxes)
-        y1 = min(box[1] for box in cluster_boxes)
-        x2 = max(box[2] for box in cluster_boxes)
-        y2 = max(box[3] for box in cluster_boxes)
-        pad_x = (x2 - x1) * padding_percent / 100
-        pad_y = (y2 - y1) * padding_percent / 100
+    padding = padding_percent / 100
+    for crowd in display_crowds:
+        x1, y1, x2, y2 = crowd.bbox
+        pad_x = (x2 - x1) * padding
+        pad_y = (y2 - y1) * padding
         draw_box(
             (
                 max(0, x1 - pad_x),
@@ -767,20 +979,9 @@ def _annotate_bbox_detections(
                 min(frame.shape[0], y2 + pad_y),
             ),
             CROWD_COLOR_BGR,
-            f"{len(cluster)} người",
-            # f"Cụm {cluster_index + 1} ({len(cluster)} người)",
+            f"{crowd.person_count} người",
         )
 
-    # cv2.putText(
-    #     annotated,
-    #     f"Inference: {inference_ms:.1f} ms | Processing: {processing_fps:.1f} FPS",
-    #     (12, 28),
-    #     cv2.FONT_HERSHEY_SIMPLEX,
-    #     0.7,
-    #     (255, 255, 255),
-    #     2,
-    #     cv2.LINE_AA,
-    # )
     return annotated
 
 
@@ -1046,17 +1247,40 @@ class CameraWorker:
                             for cluster_index, cluster in enumerate(clusters)
                             if len(cluster) >= cf.NUMBER_PERSON_IS_CROWDED
                         ]
-                        is_crowded = bool(crowded_clusters)
                         cluster_ms = (
                             time.perf_counter() - cluster_started
                         ) * 1000
+
+                        now = time.monotonic()
+                        crowd_started = time.perf_counter()
+                        while True:
+                            try:
+                                published_track_ids, publish_succeeded = (
+                                    publish_results.get_nowait()
+                                )
+                            except queue.Empty:
+                                break
+                            crowd_persistence.complete_publish(
+                                published_track_ids,
+                                publish_succeeded,
+                                now,
+                            )
+                        display_crowds, ready_clusters = crowd_persistence.update(
+                            clusters,
+                            crowded_clusters,
+                            dets,
+                            now,
+                            frame_interval_s=frame_interval_s,
+                        )
+                        is_crowded = bool(display_crowds)
+                        crowd_ms = (time.perf_counter() - crowd_started) * 1000
 
                         frame_height, frame_width = frame.shape[:2]
                         bbox_build_started = time.perf_counter()
                         bbox_detections = _build_bbox_detections(
                             dets,
                             clusters,
-                            crowded_clusters,
+                            display_crowds,
                             frame_width,
                             frame_height,
                             cf.PUBLISH_ALL_PERSON_BBOX,
@@ -1067,7 +1291,7 @@ class CameraWorker:
                         ) * 1000
 
                         hud_text = (
-                            f"Số đám đông: {len(crowded_clusters)} cụm"
+                            f"Số đám đông: {len(display_crowds)} cụm"
                             if is_crowded
                             else f"Số người phát hiện: {len(dets)}"
                         )
@@ -1091,28 +1315,6 @@ class CameraWorker:
                         bbox_publish_count += 1
                         bbox_publish_success_count += int(bbox_published)
 
-                        now = time.monotonic()
-                        crowd_started = time.perf_counter()
-                        while True:
-                            try:
-                                published_track_ids, publish_succeeded = (
-                                    publish_results.get_nowait()
-                                )
-                            except queue.Empty:
-                                break
-                            crowd_persistence.complete_publish(
-                                published_track_ids,
-                                publish_succeeded,
-                                now,
-                            )
-                        ready_clusters = crowd_persistence.update(
-                            crowded_clusters,
-                            dets,
-                            now,
-                            frame_interval_s=frame_interval_s,
-                        )
-                        crowd_ms = (time.perf_counter() - crowd_started) * 1000
-
                         if now - last_cluster_log_time >= 1.0:
                             cluster_details = [
                                 {
@@ -1133,10 +1335,11 @@ class CameraWorker:
                             ]
                             log.info(
                                 "Cluster summary camera=%s people=%d clusters=%d "
-                                "crowd_threshold>=%d details=%s",
+                                "display_crowds=%d crowd_threshold>=%d details=%s",
                                 self.camera.code,
                                 len(dets),
                                 len(clusters),
+                                len(display_crowds),
                                 cf.NUMBER_PERSON_IS_CROWDED,
                                 cluster_details,
                             )
@@ -1147,8 +1350,9 @@ class CameraWorker:
                         )
                         if is_crowded and not was_crowded:
                             log.info(
-                                "Crowd candidate detected camera=%s; waiting %.1fs persistence",
+                                "Crowd candidate detected camera=%s active_crowds=%d; waiting %.1fs persistence",
                                 self.camera.code,
+                                len(display_crowds),
                                 cf.CROWD_PERSISTENCE_SECONDS,
                             )
                             was_crowded = True
@@ -1173,7 +1377,7 @@ class CameraWorker:
                             debug_frame = _annotate_bbox_detections(
                                 frame,
                                 dets,
-                                crowded_clusters,
+                                display_crowds,
                                 cf.CROWD_BBOX_PADDING_PERCENT,
                                 inference_ms,
                                 processing_fps,
@@ -1247,14 +1451,14 @@ class CameraWorker:
                                 self.camera.code,
                                 [
                                     {
-                                        "cluster_id": cluster_index + 1,
+                                        "cluster_id": crowd_id,
                                         "person_count": len(cluster),
                                         "detections": cluster,
                                         "track_ids": sorted(
                                             t for t in track_ids if t >= 0
                                         ),
                                     }
-                                    for cluster_index, cluster, track_ids in ready_clusters
+                                    for crowd_id, cluster, track_ids in ready_clusters
                                 ],
                                 snapshot_jpg=snapshot_bytes,
                                 track_ids=event_track_ids,
