@@ -232,7 +232,9 @@ Chi tiết từng tham số xem tại [mục 7](#7-cấu-hình-và-điều-chỉ
 
 ### 5.6. [`src/detector.py`](src/detector.py): `PersonDetector`
 
-- **Chọn backend (`_select_runtime`):** CUDA TensorRT (`.engine` nếu `YOLO_INFERENCE_BACKEND="tensorrt"`) → PyTorch CUDA (`half` theo `YOLO_HALF_PRECISION`) → OpenVINO (CPU Intel nếu có thư mục model OpenVINO) → PyTorch CPU.
+- **Chọn backend (`_select_runtime`):**
+  - **TensorRT (`.engine`) tự động trên GPU CUDA:** Khi `YOLO_INFERENCE_BACKEND = "tensorrt"` (và `WEIGHT_YOLO_MODEL_PATH` trỏ tới `<ten_model>.engine` hoặc `<ten_model>.pt`), nếu file `.engine` chưa tồn tại, hệ thống sẽ tự gọi `YOLO(<ten_model>.pt).export(format="engine", imgsz=YOLO_IMGSZ, ...)` **bên trong `_SHARED_MODEL_LOCK`** để build `.engine` khớp đúng GPU/CUDA của máy chạy, giải phóng VRAM PyTorch rồi load `.engine` với `task="detect"`. Nếu export lỗi (thiếu thư viện hoặc OOM), hệ thống tự dọn file `.engine` dở dang và fallback an toàn về PyTorch CUDA.
+  - Thứ tự ưu tiên chung: TensorRT CUDA → PyTorch CUDA (`half` theo `YOLO_HALF_PRECISION`) → OpenVINO (CPU/iGPU Intel nếu có thư mục model OpenVINO) → PyTorch CPU.
 - **Định cấu hình CPU thread:** `_configure_torch_runtime()` và `_restore_torch_runtime()` áp dụng `torch.set_num_threads(cf.YOLO_CPU_THREADS)` cho **cả máy CPU lẫn máy có GPU CUDA** (tránh PyTorch tự bung 20+ thread CPU làm nghẽn FFmpeg).
 - **Tách inference và tracking:**
   - `self._model.predict(..., imgsz=..., conf=..., iou=cf.YOLO_MODEL_IOU, ...)` chạy bên trong `with _INFERENCE_SEMAPHORE, _MODEL_INFERENCE_LOCK:`.
@@ -322,9 +324,9 @@ Chi tiết đầy đủ về giao thức S3, quy ước key và cách test xem t
 
 | Tham số | Giá trị hiện tại | Tác dụng & Hướng điều chỉnh |
 | :--- | :--- | :--- |
-| `WEIGHT_YOLO_MODEL_PATH` | `./resources/runs/train/weights/24_nov.pt` | Đường dẫn weights YOLO (`.pt`). Nếu chuyển sang TensorRT, đặt file `.engine` cùng tên/thư mục và đổi `YOLO_INFERENCE_BACKEND = "tensorrt"`. |
+| `WEIGHT_YOLO_MODEL_PATH` | `./resources/runs/train/weights/24_nov.pt` | Đường dẫn weights YOLO (`.pt` hoặc `.engine`). Khi đặt `<ten_model>.engine` và bật `YOLO_INFERENCE_BACKEND = "tensorrt"`, nếu chưa có file `.engine` hệ thống sẽ tự convert từ `<ten_model>.pt` cùng thư mục ngay trên GPU máy chạy. Khi đổi `YOLO_IMGSZ` hoặc đổi GPU, hãy xóa file `.engine` cũ để tự export lại. |
 | `OPENVINO_MODEL_PATH` | `./resources/runs/train/weights/final_openvino_model` | Thư mục model OpenVINO (chỉ dùng khi máy không có GPU CUDA). |
-| `YOLO_INFERENCE_BACKEND` | `"auto"` | Chọn runtime: `"auto"`, `"pytorch"`, `"cuda"`, `"openvino"`, `"tensorrt"`. Đổi sang `"tensorrt"` sau khi export `.engine` để tăng mạnh FPS trên GPU NVIDIA. |
+| `YOLO_INFERENCE_BACKEND` | `"auto"` | Chọn runtime: `"auto"`, `"pytorch"`, `"cuda"`, `"openvino"`, `"tensorrt"`. Đổi sang `"tensorrt"` trên máy CUDA để hệ thống dùng (hoặc tự export lần đầu từ `.pt`) file `.engine` giúp tăng mạnh FPS. |
 | `YOLO_OPENVINO_DEVICE` | `"intel:cpu"` | Thiết bị chạy OpenVINO (`"intel:cpu"`, `"intel:gpu"`, `"auto"`). |
 | `YOLO_IMGSZ` | `1280` | Kích thước cạnh ảnh đưa vào YOLO. **Tăng** (`1280`): bắt người ở xa/nhỏ tốt hơn nhưng inference nặng hơn rõ rệt. **Giảm** (`960` / `640`): tăng FPS nhanh nhưng dễ sót người nhỏ ở xa. |
 | `YOLO_HALF_PRECISION` | `True` | Dùng FP16 trên GPU NVIDIA (nhanh hơn và tốn ít VRAM hơn FP32). Không có tác dụng trên CPU. |

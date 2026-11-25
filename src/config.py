@@ -15,35 +15,35 @@ def _env_bool(name: str, default: str = "false") -> bool:
 # ==============================================================================
 # 1. THÔNG TIN ĐỊNH DANH & KẾT NỐI SERVER (Đọc từ .env)
 # ==============================================================================
-MODULE = os.environ["MODULE"].strip().upper()         # Tên module AI khớp cấu hình VMS (vd: CROWD_DETECTION)
-ZONE_ID = os.environ["ZONE_ID"].strip()               # ID khu vực dùng để subscribe danh sách camera qua MQTT
-ORG_ID = os.environ["ORG_ID"].strip()                 # ID tổ chức/công ty gửi kèm trong payload BBox
+MODULE = os.environ["MODULE"].strip().upper()         
+ZONE_ID = os.environ["ZONE_ID"].strip()           
+ORG_ID = os.environ["ORG_ID"].strip()      
 
-MQTT_HOST = os.environ["MQTT_HOST"].strip()           # Địa chỉ IP/domain của MQTT Broker
-MQTT_PORT = int(os.environ["MQTT_PORT"])              # Cổng WebSocket của MQTT Broker
-MQTT_PATH = os.environ["MQTT_PATH"].strip()           # Đường dẫn WebSocket endpoint (thường là "/mqtt")
-MQTT_USER = os.environ["MQTT_USER"]                   # Tên đăng nhập MQTT Broker
-MQTT_PASS = os.environ["MQTT_PASS"]                   # Mật khẩu MQTT Broker
-MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"].strip() # ID client MQTT duy nhất cho mỗi server chạy (trùng sẽ bị đá)
-MQTT_TLS_ENABLED = False                              # Bật/tắt SSL/TLS khi kết nối MQTT WebSocket
+MQTT_HOST = os.environ["MQTT_HOST"].strip()   
+MQTT_PORT = int(os.environ["MQTT_PORT"])            
+MQTT_PATH = os.environ["MQTT_PATH"].strip()          
+MQTT_USER = os.environ["MQTT_USER"]             
+MQTT_PASS = os.environ["MQTT_PASS"]                 
+MQTT_CLIENT_ID = os.environ["MQTT_CLIENT_ID"].strip() 
+MQTT_TLS_ENABLED = False                              
 
 # Cấu hình MinIO S3 Snapshot Upload
-VMS_S3_ENDPOINT = os.getenv("VMS_S3_ENDPOINT", "http://192.168.1.250:18646").strip() # URL endpoint MinIO S3 lưu ảnh snapshot
-VMS_S3_BUCKET = os.getenv("VMS_S3_BUCKET", "vms-captures").strip()                   # Tên bucket chứa ảnh cảnh báo trên MinIO
-VMS_S3_ACCESS_KEY = os.getenv("VMS_S3_ACCESS_KEY", "atin").strip()                   # Access key đăng nhập MinIO (policy edge-ai-writer)
-VMS_S3_SECRET_KEY = os.getenv("VMS_S3_SECRET_KEY", "").strip()                       # Secret key tương ứng đọc từ .env
+VMS_S3_ENDPOINT = os.getenv("VMS_S3_ENDPOINT", "http://192.168.1.250:18646").strip()
+VMS_S3_BUCKET = os.getenv("VMS_S3_BUCKET", "vms-captures").strip()                  
+VMS_S3_ACCESS_KEY = os.getenv("VMS_S3_ACCESS_KEY", "atin").strip()                
+VMS_S3_SECRET_KEY = os.getenv("VMS_S3_SECRET_KEY", "").strip()              
 
 # ==============================================================================
 # 2. CẤU HÌNH MODEL AI, FFmpeg & INFERENCE (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
-WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/24_nov.pt"         # Đường dẫn weights YOLO (.pt); nếu dùng TensorRT đặt file .engine cùng tên
-OPENVINO_MODEL_PATH = "./resources/runs/train/weights/final_openvino_model" # Thư mục model OpenVINO (dùng khi máy chỉ có CPU Intel)
-YOLO_INFERENCE_BACKEND = "auto"   # Runtime suy luận: "auto" | "pytorch" | "cuda" | "openvino" | "tensorrt"
+WEIGHT_YOLO_MODEL_PATH = "./resources/runs/train/weights/24_nov.pt"         # Đường dẫn weights YOLO (.pt hoặc .engine); nếu dùng "tensorrt" mà thiếu .engine sẽ tự export từ .pt cùng tên
+OPENVINO_MODEL_PATH = "./resources/runs/train/weights/final_openvino_model"
+YOLO_INFERENCE_BACKEND = "tensorrt"   # Runtime suy luận: "auto" | "pytorch" | "cuda" | "openvino" | "tensorrt" 
 YOLO_OPENVINO_DEVICE = "intel:cpu" # Thiết bị OpenVINO ("intel:cpu", "intel:gpu", "auto")
-YOLO_IMGSZ = 1280                 # Kích thước cạnh ảnh đưa vào YOLO; tăng bắt người xa tốt hơn nhưng infer chậm hơn đáng kể
+YOLO_IMGSZ = 1280                
 YOLO_HALF_PRECISION = True        # Bật FP16 (nhanh hơn, ít VRAM hơn) khi chạy trên GPU CUDA/TensorRT
-YOLO_MODEL_CONF = 0.7             # Ngưỡng tin cậy tối thiểu; tăng giảm báo nhầm, giảm bắt nhạy người xa/che khuất
-YOLO_MODEL_IOU = 0.7              # Ngưỡng IoU khi lọc NMS; giảm xuống (0.5-0.6) nếu 1 người bị tách thành 2 bbox
+YOLO_MODEL_CONF = 0.7            
+YOLO_MODEL_IOU = 0.55              # Ngưỡng IoU khi lọc NMS; giảm xuống (0.5-0.6) nếu 1 người bị tách thành 2 bbox
 YOLO_CPU_THREADS = 6              # Số luồng CPU cấp cho PyTorch (áp dụng cho cả CPU lẫn GPU); nên <= số nhân vật lý trừ phần cho FFmpeg
 MAX_CONCURRENT_INFERENCES = 1     # Số camera gọi model.predict() đồng thời; để 1 tránh tranh chấp lock GPU (ByteTrack chạy riêng ngoài lock)
 FFMPEG_MAX_WIDTH = 1280           # Giới hạn chiều rộng tối đa đầu ra FFmpeg (giữ tỷ lệ gốc, giảm tải pipe/RAM/resize; 0 = giữ nguyên gốc)
@@ -52,11 +52,11 @@ FFMPEG_MAX_WIDTH = 1280           # Giới hạn chiều rộng tối đa đầu
 # 3. CẤU HÌNH ĐÁNH GIÁ KHOẢNG CÁCH & ĐÁM ĐÔNG (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
 PROXIMITY_ALPHA = 2.0             # Hệ số khoảng cách đứng gần (alpha * chiều dài cơ thể TB); tăng = dễ gom thành cụm hơn
-PROXIMITY_Y_SCALE = 1.9           # Hệ số kéo giãn trục dọc Y bù góc nghiêng camera; camera nhìn chéo mạnh tăng lên, nhìn thẳng ~1.0
-PROXIMITY_LENGTH_MODE = "max"     # Thước đo cơ thể: "max" = max(w, h) (ổn định khi ngồi/cúi) | "height" = h
+PROXIMITY_Y_SCALE = 1.2           # Hệ số kéo giãn trục dọc Y bù góc nghiêng camera; camera nhìn chéo mạnh tăng lên, nhìn thẳng ~1.0
+PROXIMITY_LENGTH_MODE = "max"     # max | h
 
-NUMBER_PERSON_IS_CROWDED = 5      # Số người tối thiểu trong 1 cụm liên thông để tính là đám đông
-CROWD_PERSISTENCE_SECONDS = 20.0  # Đám đông phải duy trì liên tục đủ số giây này mới chụp snapshot S3 và gửi event VMS
+NUMBER_PERSON_IS_CROWDED = 5     
+CROWD_PERSISTENCE_SECONDS = 30.0  
 CROWD_TRACK_GRACE_SECONDS = 3.5   # Thời gian chịu mất dấu tạm thời (giây) trước khi reset bộ đếm CROWD_PERSISTENCE_SECONDS
 CROWD_SPATIAL_IOU_THRESHOLD = 0.25 # Độ chồng lấp IoU tối thiểu giữa 2 frame để khớp là cùng 1 cụm đám đông
 CROWD_CENTER_DISTANCE_RATIO = 0.8  # Khoảng cách tâm tương đối tối đa để vẫn coi là cùng 1 cụm đám đông
@@ -77,11 +77,11 @@ CROWD_BBOX_SMOOTHING_ALPHA = 0.35 # Hệ số làm mượt EMA tọa độ bbox 
 # 5. CẤU HÌNH LOG & DEBUG (Chỉnh sửa trực tiếp tại đây)
 # ==============================================================================
 LOG_LEVEL = "INFO"                # Mức log ghi ra console và file ("DEBUG" | "INFO" | "WARNING" | "ERROR")
-DEBUG_VIDEO_ENABLED = False       # True = lưu video MP4 đã vẽ khung vào resources/debug_videos/ (tốn CPU, tắt trên Production)
-DEBUG_FRAME_SAVE_ENABLED = False  # True = chụp ảnh JPEG định kỳ mỗi 5s vào resources/img_test/
-DEBUG_VIDEO_FPS = 10.0            # Tốc độ FPS khai báo cho file video debug xuất ra
-DEBUG_MAX_SAVED_FRAMES = 200      # Số ảnh debug tối đa giữ lại trong resources/img_test/ (tự xóa ảnh cũ nhất)
-DEBUG_MAX_SAVED_VIDEOS = 10       # Số video debug tối đa giữ lại trong resources/debug_videos/ (tự xóa video cũ nhất)
+DEBUG_VIDEO_ENABLED = False       
+DEBUG_FRAME_SAVE_ENABLED = False 
+DEBUG_VIDEO_FPS = 10.0         
+DEBUG_MAX_SAVED_FRAMES = 500    
+DEBUG_MAX_SAVED_VIDEOS = 10    
 
 if CROWD_PERSISTENCE_SECONDS <= 0:
     raise ValueError("CROWD_PERSISTENCE_SECONDS must be greater than 0")
@@ -113,3 +113,5 @@ if CROWD_BBOX_HOLD_SECONDS < 0:
     raise ValueError("CROWD_BBOX_HOLD_SECONDS must not be negative")
 if not 0.0 < CROWD_BBOX_SMOOTHING_ALPHA <= 1.0:
     raise ValueError("CROWD_BBOX_SMOOTHING_ALPHA must be in (0, 1]")
+if YOLO_INFERENCE_BACKEND.strip().lower() not in {"auto", "pytorch", "cuda", "openvino", "tensorrt"}:
+    raise ValueError("YOLO_INFERENCE_BACKEND must be one of: auto, pytorch, cuda, openvino, tensorrt")

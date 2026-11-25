@@ -1,6 +1,10 @@
+import gc
+import json
 import logging
 from pathlib import Path
+import shutil
 import threading
+import time
 from typing import Any
 
 import cv2
@@ -88,6 +92,126 @@ def _resolve_openvino_device(requested_device: str) -> str:
     return req
 
 
+def _read_engine_metadata(engine_path: Path) -> dict[str, Any]:
+    """Đọc metadata JSON nhúng ở đầu file TensorRT .engine do Ultralytics export."""
+    try:
+        file_size = engine_path.stat().st_size
+        if file_size < 4:
+            return {}
+        with engine_path.open("rb") as f:
+            header_len = int.from_bytes(f.read(4), byteorder="little")
+            if 0 < header_len <= file_size - 4:
+                meta = json.loads(f.read(header_len).decode("utf-8"))
+                if isinstance(meta, dict):
+                    return meta
+    except Exception:
+        log.debug("Không đọc được metadata header từ %s", engine_path)
+    return {}
+
+
+def _read_engine_static_imgsz(engine_path: Path) -> int | None:
+    meta = _read_engine_metadata(engine_path)
+    if not meta:
+        return None
+    args = meta.get("args") or {}
+    is_dynamic = bool(args.get("dynamic", False)) if isinstance(args, dict) else False
+    if is_dynamic:
+        return None
+    imgsz = meta.get("imgsz")
+    if isinstance(imgsz, list) and imgsz:
+        val = int(imgsz[0])
+        return val if val > 0 else None
+    if isinstance(imgsz, (int, float)) and int(imgsz) > 0:
+        return int(imgsz)
+    return None
+
+
+def _resolve_engine_imgsz(engine_path: Path, requested_imgsz: int) -> int:
+    static_imgsz = _read_engine_static_imgsz(engine_path)
+    if static_imgsz is not None and static_imgsz != requested_imgsz:
+        log.warning(
+            "File TensorRT %s được export với imgsz=%d khác YOLO_IMGSZ=%d; "
+            "đang dùng imgsz=%d (hãy xóa file .engine và khởi động lại nếu muốn tự export lại theo YOLO_IMGSZ=%d)",
+            engine_path,
+            static_imgsz,
+            requested_imgsz,
+            static_imgsz,
+            requested_imgsz,
+        )
+        return static_imgsz
+    return requested_imgsz
+
+
+def _build_tensorrt_export_kwargs(imgsz: int, half: bool) -> dict[str, Any]:
+    export_kwargs: dict[str, Any] = {
+        "format": "engine",
+        "imgsz": int(imgsz),
+        "device": 0,
+        "batch": 1,
+        "simplify": True,
+    }
+    if half:
+        if _SUPPORTS_QUANTIZE_ARG:
+            export_kwargs["quantize"] = 16
+        else:
+            export_kwargs["half"] = True
+    elif not _SUPPORTS_QUANTIZE_ARG:
+        export_kwargs["half"] = False
+    return export_kwargs
+
+
+def _export_tensorrt_engine(
+    pt_path: Path,
+    engine_path: Path,
+    imgsz: int,
+    half: bool,
+) -> Path:
+    """Tự động convert model PyTorch (.pt) sang TensorRT (.engine) trên GPU hiện tại."""
+    log.info(
+        "Chưa có file TensorRT tại %s -> bắt đầu tự động convert từ %s "
+        "(imgsz=%d, fp16=%s, device=0, lần đầu có thể mất 1-5 phút)...",
+        engine_path,
+        pt_path,
+        imgsz,
+        half,
+    )
+    started = time.perf_counter()
+    pt_model: YOLO | None = None
+    try:
+        pt_model = YOLO(str(pt_path))
+        exported = Path(
+            pt_model.export(**_build_tensorrt_export_kwargs(imgsz, half))
+        )
+        if exported.is_file() and exported.resolve() != engine_path.resolve():
+            engine_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(exported), str(engine_path))
+        if not engine_path.is_file() or engine_path.stat().st_size <= 0:
+            raise RuntimeError(
+                f"TensorRT export finished but output engine missing or empty: {engine_path}"
+            )
+        elapsed_s = time.perf_counter() - started
+        size_mb = engine_path.stat().st_size / (1024 * 1024)
+        log.info(
+            "Đã export TensorRT thành công: %s (%.1f MB, %.1fs)",
+            engine_path,
+            size_mb,
+            elapsed_s,
+        )
+        return engine_path
+    except Exception:
+        if engine_path.is_file():
+            try:
+                engine_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    finally:
+        del pt_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 class PersonDetector:
     def __init__(
         self,
@@ -112,24 +236,27 @@ class PersonDetector:
         self._tracker = BYTETracker(
             IterableSimpleNamespace(**_get_bytetrack_cfg())
         )
-        self._backend, self._device, model_target, self._imgsz, self._half = (
-            self._select_runtime(weights_path)
-        )
         self._configure_torch_runtime()
 
-        model_key = (
-            self._backend,
-            str(self._device),
-            str(model_target.resolve()),
-            self._imgsz,
-            self._half,
-        )
         with _SHARED_MODEL_LOCK:
+            self._backend, self._device, model_target, self._imgsz, self._half = (
+                self._select_runtime(weights_path)
+            )
+            model_key = (
+                self._backend,
+                str(self._device),
+                str(model_target.resolve()),
+                self._imgsz,
+                self._half,
+            )
             cached = _SHARED_MODELS.get(model_key)
             if cached is None:
                 if self._backend == "openvino":
                     model = YOLO(str(model_target), task="detect")
                     names = self._load_openvino_names(model, model_target)
+                elif self._backend == "tensorrt":
+                    model = YOLO(str(model_target), task="detect")
+                    names = self._load_engine_names(model, model_target)
                 else:
                     model = YOLO(str(model_target))
                     names = model.names
@@ -173,13 +300,66 @@ class PersonDetector:
 
         # 1. Ưu tiên GPU NVIDIA (ví dụ RTX A400 4GB VRAM trên môi trường MVP)
         if has_cuda and requested_backend in {"auto", "pytorch", "cuda", "tensorrt"}:
-            engine_path = weights_path.with_suffix(".engine")
-            if requested_backend == "tensorrt" and engine_path.is_file():
+            is_engine_target = weights_path.suffix.lower() == ".engine"
+            engine_path = (
+                weights_path
+                if is_engine_target
+                else weights_path.with_suffix(".engine")
+            )
+            pt_path = weights_path.with_suffix(".pt")
+
+            if requested_backend == "tensorrt":
+                if engine_path.is_file():
+                    return (
+                        "tensorrt",
+                        0,
+                        engine_path,
+                        _resolve_engine_imgsz(engine_path, cf.YOLO_IMGSZ),
+                        cf.YOLO_HALF_PRECISION,
+                    )
+                if not pt_path.is_file():
+                    raise FileNotFoundError(
+                        f"TensorRT engine not found: {engine_path}, and source PyTorch "
+                        f"weights not found for auto-export: {pt_path}"
+                    )
+                try:
+                    exported_engine = _export_tensorrt_engine(
+                        pt_path,
+                        engine_path,
+                        cf.YOLO_IMGSZ,
+                        cf.YOLO_HALF_PRECISION,
+                    )
+                    return (
+                        "tensorrt",
+                        0,
+                        exported_engine,
+                        _resolve_engine_imgsz(exported_engine, cf.YOLO_IMGSZ),
+                        cf.YOLO_HALF_PRECISION,
+                    )
+                except Exception:
+                    log.exception(
+                        "Auto-export TensorRT thất bại từ %s sang %s",
+                        pt_path,
+                        engine_path,
+                    )
+                    log.warning(
+                        "Fallback sang PyTorch CUDA với model nguồn %s",
+                        pt_path,
+                    )
+                    return (
+                        "pytorch",
+                        0,
+                        pt_path,
+                        cf.YOLO_IMGSZ,
+                        cf.YOLO_HALF_PRECISION,
+                    )
+
+            if is_engine_target and engine_path.is_file():
                 return (
                     "tensorrt",
                     0,
                     engine_path,
-                    cf.YOLO_IMGSZ,
+                    _resolve_engine_imgsz(engine_path, cf.YOLO_IMGSZ),
                     cf.YOLO_HALF_PRECISION,
                 )
             if not weights_path.exists():
@@ -192,7 +372,25 @@ class PersonDetector:
                 cf.YOLO_HALF_PRECISION,
             )
 
-        # 2. Trên máy CPU-only (ví dụ i7-8650U): ưu tiên OpenVINO nếu backend=auto/openvino
+        # 2. Nếu bật tensorrt trên máy không có CUDA -> fallback về PyTorch CPU
+        if not has_cuda and requested_backend == "tensorrt":
+            fallback_path = (
+                weights_path.with_suffix(".pt")
+                if weights_path.suffix.lower() == ".engine"
+                else weights_path
+            )
+            log.warning(
+                "CUDA không khả dụng cho YOLO_INFERENCE_BACKEND='tensorrt', "
+                "fallback về PyTorch CPU với %s",
+                fallback_path,
+            )
+            if not fallback_path.exists():
+                raise FileNotFoundError(
+                    f"CUDA unavailable for TensorRT and PyTorch fallback weights not found: {fallback_path}"
+                )
+            return ("pytorch", "cpu", fallback_path, cf.YOLO_IMGSZ, False)
+
+        # 3. Trên máy CPU-only (ví dụ i7-8650U): ưu tiên OpenVINO nếu backend=auto/openvino
         if requested_backend in {"auto", "openvino"}:
             ov_dir = _resolve_openvino_dir(weights_path)
             if ov_dir is not None:
@@ -206,12 +404,27 @@ class PersonDetector:
                     weights_path,
                 )
 
-        # 3. Fallback về PyTorch (CPU hoặc CUDA)
-        if not weights_path.exists():
-            raise FileNotFoundError(f"Model path not found: {weights_path}")
+        # 4. Fallback về PyTorch (CPU hoặc CUDA)
+        fallback_path = weights_path
+        if not has_cuda and weights_path.suffix.lower() == ".engine":
+            fallback_path = weights_path.with_suffix(".pt")
+            log.warning(
+                "CUDA không khả dụng để chạy %s, fallback sang PyTorch CPU với %s",
+                weights_path,
+                fallback_path,
+            )
+        if not fallback_path.exists():
+            raise FileNotFoundError(f"Model path not found: {fallback_path}")
         device: int | str = 0 if has_cuda else "cpu"
         half = bool(has_cuda and cf.YOLO_HALF_PRECISION)
-        return ("pytorch", device, weights_path, cf.YOLO_IMGSZ, half)
+        return ("pytorch", device, fallback_path, cf.YOLO_IMGSZ, half)
+
+    @staticmethod
+    def _load_engine_names(model: YOLO, engine_path: Path) -> dict | list:
+        meta = _read_engine_metadata(engine_path)
+        if meta.get("names"):
+            return meta["names"]
+        return model.names
 
     @staticmethod
     def _load_openvino_names(model: YOLO, ov_dir: Path) -> dict | list:
